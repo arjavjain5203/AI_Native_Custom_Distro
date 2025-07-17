@@ -1,0 +1,13 @@
+[Unit]
+Description=AI OS First-Boot Model Installer
+After=NetworkManager.service network-online.target ollama.service
+Wants=NetworkManager.service network-online.target ollama.service
+ConditionPathExists=!/var/lib/ai-os/installer-complete
+
+[Service]
+Type=idle
+ExecStart=/usr/local/bin/ai-os-installer
+StateDirectory=ai-os
+
+[Install]
+WantedBy=multi-user.target
