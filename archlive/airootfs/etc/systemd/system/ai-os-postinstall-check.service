@@ -1,0 +1,14 @@
+[Unit]
+Description=AI OS Post-Install Health Check
+After=ai-os.service network-online.target
+Wants=ai-os.service
+ConditionPathExists=/var/lib/ai-os/installer-complete
+ConditionPathExists=!/var/lib/ai-os/postinstall-check-complete
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ai-os-postinstall-check
+StateDirectory=ai-os
+
+[Install]
+WantedBy=multi-user.target
