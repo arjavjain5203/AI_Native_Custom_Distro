@@ -1,0 +1,17 @@
+[Unit]
+Description=AI-Native Developer Environment Daemon
+After=network-online.target ollama.service
+Wants=network-online.target ollama.service
+
+[Service]
+Type=simple
+Environment=AI_OS_MEMORY_DB=/var/lib/ai-os/task_history.db
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/opt/ai-os
+ExecStart=/usr/local/bin/ai-daemon
+Restart=on-failure
+RestartSec=3
+StateDirectory=ai-os
+
+[Install]
+WantedBy=multi-user.target
