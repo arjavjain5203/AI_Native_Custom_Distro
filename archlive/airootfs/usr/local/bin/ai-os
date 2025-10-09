@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Launcher for the AI OS terminal inside the live environment."""
+
+from __future__ import annotations
+
+import os
+import sys
+
+
+INSTALL_ROOT = os.environ.get("AI_OS_INSTALL_ROOT", "/opt/ai-os")
+
+if INSTALL_ROOT not in sys.path:
+    sys.path.insert(0, INSTALL_ROOT)
+
+from ai_core.cli.main import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
