@@ -1,0 +1,641 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="/var/lib/ai-os"
+STAMP_FILE="${STATE_DIR}/installer-complete"
+CONFIG_DIR="/etc/ai-os"
+CONFIG_FILE="${CONFIG_DIR}/models.json"
+LOG_FILE="/var/log/ai-os-installer.log"
+PROMPT_TIMEOUT="${AI_OS_INSTALLER_TIMEOUT:-10}"
+OLLAMA_READY_TIMEOUT="${AI_OS_OLLAMA_READY_TIMEOUT:-45}"
+OLLAMA_PULL_TIMEOUT="${AI_OS_OLLAMA_PULL_TIMEOUT:-900}"
+HEALTHCHECK_TRIGGER_SERVICE="ai-os-postinstall-check.service"
+NETWORK_CHECK_HOST="${AI_OS_INSTALLER_NETWORK_CHECK_HOST:-google.com}"
+SERIAL_DEVICE="${AI_OS_INSTALLER_SERIAL_DEVICE:-/dev/ttyS0}"
+OLLAMA_STORAGE_DIR="${AI_OS_OLLAMA_STORAGE_DIR:-/var/lib/ollama}"
+NETWORK_READY=0
+INTERACTIVE=0
+AUTOMATED_SERIAL_MODE=0
+FAILURE_MARKER_EMITTED=0
+
+log() {
+    printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
+}
+
+emit_serial_line() {
+    local message="$1"
+    if [[ -c "${SERIAL_DEVICE}" && -w "${SERIAL_DEVICE}" ]]; then
+        printf '%s\n' "${message}" > "${SERIAL_DEVICE}" 2>/dev/null || true
+    fi
+}
+
+emit_stage() {
+    local stage="$1"
+    local marker="AIOS_STAGE:${stage}"
+    printf '%s\n' "${marker}"
+    emit_serial_line "${marker}"
+}
+
+emit_failure() {
+    local reason="$1"
+    FAILURE_MARKER_EMITTED=1
+    emit_stage "INSTALL_FAILED:${reason}"
+}
+
+ensure_dirs() {
+    mkdir -p "${STATE_DIR}" "${CONFIG_DIR}" "$(dirname "${LOG_FILE}")"
+}
+
+setup_logging() {
+    touch "${LOG_FILE}"
+    exec > >(tee -a "${LOG_FILE}") 2>&1
+    log "Starting AI OS first-boot installer."
+}
+
+detect_interactive_mode() {
+    if [ -t 1 ]; then
+        INTERACTIVE=1
+    else
+        INTERACTIVE=0
+    fi
+
+    if grep -Fq 'console=ttyS0,115200' /proc/cmdline 2>/dev/null && [[ -c "${SERIAL_DEVICE}" ]]; then
+        AUTOMATED_SERIAL_MODE=1
+    fi
+}
+
+log_unexpected_exit() {
+    local status=$?
+    if [[ ${status} -ne 0 ]]; then
+        log "Installer exited unexpectedly with status ${status}."
+        if [[ "${FAILURE_MARKER_EMITTED}" -ne 1 ]]; then
+            emit_failure "UNEXPECTED_EXIT_${status}"
+        fi
+    fi
+}
+
+detect_ram_gb() {
+    awk '/^MemTotal:/ { printf "%.2f", $2 / 1024 / 1024; exit }' /proc/meminfo
+}
+
+detect_cpu_cores() {
+    nproc 2>/dev/null || printf '1\n'
+}
+
+config_is_complete() {
+    [[ -f "${CONFIG_FILE}" ]] || return 1
+    python3 - "${CONFIG_FILE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for role in ("orchestrator", "planning", "coding", "analysis"):
+    role_config = config.get(role)
+    if not isinstance(role_config, dict):
+        raise SystemExit(1)
+    model_name = role_config.get("ollama")
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise SystemExit(1)
+runtime = config.get("runtime")
+if runtime != "ollama":
+    raise SystemExit(1)
+PY
+}
+
+read_config_models() {
+    python3 - "${CONFIG_FILE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+seen = set()
+for role in ("orchestrator", "planning", "coding", "analysis"):
+    model_name = config[role]["ollama"]
+    if model_name not in seen:
+        seen.add(model_name)
+        print(model_name)
+PY
+}
+
+ollama_api_ready() {
+    curl -fsS --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1
+}
+
+network_is_ready() {
+    ping -c 1 "${NETWORK_CHECK_HOST}" >/dev/null 2>&1
+}
+
+wait_for_network_manager() {
+    local elapsed=0
+
+    systemctl is-active --quiet NetworkManager.service || systemctl start NetworkManager.service
+    while (( elapsed < 20 )); do
+        if systemctl is-active --quiet NetworkManager.service; then
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    return 1
+}
+
+models_installed() {
+    local installed_models
+    installed_models="$(ollama list 2>/dev/null | awk 'NR>1 {print $1}')"
+    while IFS= read -r model_name; do
+        [[ -n "${model_name}" ]] || continue
+        grep -Fxq "${model_name}" <<<"${installed_models}" || return 1
+    done < <(read_config_models)
+}
+
+wait_for_ollama_ready() {
+    local elapsed=0
+
+    systemctl is-active --quiet ollama.service || systemctl start ollama.service
+    while (( elapsed < OLLAMA_READY_TIMEOUT )); do
+        if ollama_api_ready; then
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    return 1
+}
+
+prompt_with_timeout() {
+    local prompt="$1"
+    local default_value="$2"
+    local response=""
+
+    log "${prompt}"
+    if [[ "${INTERACTIVE}" -ne 1 ]]; then
+        log "Using default selection: ${default_value}"
+        printf '%s\n' "${default_value}"
+        return 0
+    fi
+
+    log "Auto-selecting ${default_value} in ${PROMPT_TIMEOUT} seconds..."
+    read -r -t "${PROMPT_TIMEOUT}" -p "> " response || response=""
+    printf '\n'
+
+    if [[ -z "${response}" ]]; then
+        printf '%s\n' "${default_value}"
+        return 0
+    fi
+
+    printf '%s\n' "${response}"
+}
+
+prompt_retry_or_skip() {
+    local prompt="$1"
+    local response
+
+    while true; do
+        response="$(prompt_with_timeout "${prompt}" "s")"
+        response="${response,,}"
+        case "${response}" in
+            r|retry)
+                return 0
+                ;;
+            s|skip)
+                return 1
+                ;;
+            *)
+                log "Invalid choice. Defaulting to skip."
+                return 1
+                ;;
+        esac
+    done
+}
+
+ensure_ollama_ready() {
+    while true; do
+        if wait_for_ollama_ready; then
+            emit_stage "OLLAMA_READY"
+            return 0
+        fi
+        log "Ollama service did not become ready within ${OLLAMA_READY_TIMEOUT} seconds."
+        if ! prompt_retry_or_skip \
+            "Ollama is not ready yet. Enter r to retry waiting or s to skip setup."; then
+            return 1
+        fi
+    done
+}
+
+ensure_network_ready() {
+    local choice
+    local default_choice="1"
+
+    log "Setting up internet connection..."
+    emit_stage "INSTALLER_STARTED"
+    if wait_for_network_manager; then
+        log "NetworkManager is running."
+    else
+        log "NetworkManager is not ready yet."
+    fi
+
+    if [[ "${AUTOMATED_SERIAL_MODE}" -eq 1 ]]; then
+        default_choice="3"
+        emit_stage "AUTOMATED_SERIAL_MODE"
+    fi
+
+    while true; do
+        if network_is_ready; then
+            NETWORK_READY=1
+            log "Internet connectivity verified with ping to ${NETWORK_CHECK_HOST}."
+            emit_stage "NETWORK_OK"
+            return 0
+        fi
+
+        choice="$(prompt_with_timeout \
+            $'Internet access is required for model installation.\n1. Connect via WiFi\n2. Retry connection check\n3. Skip (not recommended)' \
+            "${default_choice}")"
+        choice="${choice,,}"
+
+        case "${choice}" in
+            1|wifi|connect)
+                if ! wait_for_network_manager; then
+                    log "NetworkManager is still unavailable, so WiFi setup cannot start yet."
+                    continue
+                fi
+                if ! command -v nmtui >/dev/null 2>&1; then
+                    log "nmtui is not available in the live environment."
+                    continue
+                fi
+                log "Opening nmtui for WiFi setup. Enter your SSID and password there."
+                nmtui || true
+                ;;
+            2|retry|r)
+                log "Retrying internet connectivity check..."
+                wait_for_network_manager || log "NetworkManager is still not ready."
+                ;;
+            3|skip|s)
+                NETWORK_READY=0
+                log "No internet -> model installation will likely fail. Continuing because setup was explicitly skipped."
+                emit_stage "NETWORK_SKIPPED"
+                return 0
+                ;;
+            *)
+                log "Invalid choice. Opening WiFi setup."
+                if wait_for_network_manager && command -v nmtui >/dev/null 2>&1; then
+                    nmtui || true
+                fi
+                ;;
+        esac
+    done
+}
+
+normalize_menu_choice() {
+    local value="${1,,}"
+    case "${value}" in
+        1|quick|recommended)
+            printf '1\n'
+            ;;
+        2|advanced)
+            printf '2\n'
+            ;;
+        *)
+            printf '%s\n' "${value}"
+            ;;
+    esac
+}
+
+set_profile_models() {
+    local profile="$1"
+    case "${profile}" in
+        tiny)
+            ORCHESTRATOR_MODEL="qwen2.5:0.5b"
+            PLANNING_MODEL="qwen2.5:0.5b"
+            CODING_MODEL="qwen2.5:0.5b"
+            ANALYSIS_MODEL="qwen2.5:0.5b"
+            ;;
+        balanced)
+            ORCHESTRATOR_MODEL="qwen2.5:0.5b"
+            PLANNING_MODEL="qwen2.5:1.5b"
+            CODING_MODEL="qwen2.5:1.5b"
+            ANALYSIS_MODEL="qwen2.5:1.5b"
+            ;;
+        performance)
+            ORCHESTRATOR_MODEL="qwen2.5:0.5b"
+            PLANNING_MODEL="qwen2.5:1.5b"
+            CODING_MODEL="qwen2.5:1.5b"
+            ANALYSIS_MODEL="qwen2.5:1.5b"
+            ;;
+        *)
+            log "Unknown profile: ${profile}"
+            return 1
+            ;;
+    esac
+}
+
+recommend_profile() {
+    local ram_gb="$1"
+    python3 - "$ram_gb" <<'PY'
+import sys
+
+ram_gb = float(sys.argv[1])
+if ram_gb < 8:
+    print("tiny")
+elif ram_gb <= 16:
+    print("balanced")
+else:
+    print("balanced")
+PY
+}
+
+print_profile_summary() {
+    log "Selected models:"
+    log "  orchestrator -> ${ORCHESTRATOR_MODEL}"
+    log "  planning     -> ${PLANNING_MODEL}"
+    log "  coding       -> ${CODING_MODEL}"
+    log "  analysis     -> ${ANALYSIS_MODEL}"
+}
+
+build_unique_models() {
+    local models=("${ORCHESTRATOR_MODEL}" "${PLANNING_MODEL}" "${CODING_MODEL}" "${ANALYSIS_MODEL}")
+    local model_name
+    local unique=()
+    local seen=" "
+
+    for model_name in "${models[@]}"; do
+        [[ "${seen}" == *" ${model_name} "* ]] && continue
+        unique+=("${model_name}")
+        seen="${seen}${model_name} "
+    done
+
+    printf '%s\n' "${unique[@]}"
+}
+
+required_storage_kib() {
+    local model_name
+    local total_kib=0
+
+    while IFS= read -r model_name; do
+        [[ -n "${model_name}" ]] || continue
+        case "${model_name}" in
+            qwen2.5:0.5b)
+                total_kib=$((total_kib + 1048576))
+                ;;
+            qwen2.5:1.5b)
+                total_kib=$((total_kib + 2097152))
+                ;;
+            *)
+                total_kib=$((total_kib + 1048576))
+                ;;
+        esac
+    done < <(build_unique_models)
+
+    printf '%s\n' "${total_kib}"
+}
+
+available_storage_kib() {
+    local target_dir="${OLLAMA_STORAGE_DIR}"
+    mkdir -p "${target_dir}"
+    df -Pk "${target_dir}" | awk 'END { print $4 }'
+}
+
+ensure_storage_capacity() {
+    local required_kib available_kib
+
+    required_kib="$(required_storage_kib)"
+    available_kib="$(available_storage_kib)"
+
+    if (( available_kib >= required_kib )); then
+        return 0
+    fi
+
+    log "Insufficient free space for Ollama models in ${OLLAMA_STORAGE_DIR}."
+    log "Required: $((required_kib / 1024)) MiB, available: $((available_kib / 1024)) MiB."
+    log "Increase available writable storage or run the installer after the system is installed to disk."
+    emit_failure "INSUFFICIENT_STORAGE"
+    return 1
+}
+
+write_model_config() {
+    cat > "${CONFIG_FILE}" <<EOF
+{
+  "runtime": "ollama",
+  "orchestrator": {
+    "ollama": "${ORCHESTRATOR_MODEL}"
+  },
+  "planning": {
+    "ollama": "${PLANNING_MODEL}"
+  },
+  "coding": {
+    "ollama": "${CODING_MODEL}"
+  },
+  "analysis": {
+    "ollama": "${ANALYSIS_MODEL}"
+  }
+}
+EOF
+}
+
+validate_written_config() {
+    if config_is_complete; then
+        emit_stage "MODELS_CONFIG_WRITTEN"
+        return 0
+    fi
+    log "Generated ${CONFIG_FILE} is invalid."
+    rm -f "${CONFIG_FILE}"
+    emit_failure "MODELS_CONFIG_INVALID"
+    return 1
+}
+
+pull_model_with_retry() {
+    local model_name="$1"
+    local total="$2"
+    local index="$3"
+    local attempt
+    local pull_status
+
+    emit_stage "MODEL_PULL_START:${model_name}"
+    while true; do
+        for attempt in 1 2; do
+            log "Installing model (${index}/${total}): ${model_name}..."
+            if timeout --foreground "${OLLAMA_PULL_TIMEOUT}" \
+                ollama pull "${model_name}" 2>&1 \
+                | stdbuf -oL tr '\r' '\n' \
+                | while IFS= read -r line; do
+                    [[ -n "${line}" ]] || continue
+                    log "ollama pull (${model_name}): ${line}"
+                    emit_serial_line "AIOS_PULL:${model_name}:${line}"
+                done; then
+                emit_stage "MODEL_PULL_OK:${model_name}"
+                return 0
+            fi
+            pull_status=$?
+            if [[ "${pull_status}" -eq 124 ]]; then
+                log "Attempt ${attempt} timed out for ${model_name} after ${OLLAMA_PULL_TIMEOUT} seconds."
+                emit_serial_line "AIOS_PULL_TIMEOUT:${model_name}:${OLLAMA_PULL_TIMEOUT}"
+            else
+                log "Attempt ${attempt} failed for ${model_name} with status ${pull_status}."
+                emit_serial_line "AIOS_PULL_FAILED:${model_name}:status=${pull_status}"
+            fi
+        done
+
+        if ! prompt_retry_or_skip \
+            "Failed to install ${model_name}. Enter r to retry or s to skip setup."; then
+            emit_failure "MODEL_PULL_FAILED:${model_name}"
+            return 1
+        fi
+    done
+}
+
+run_model_install() {
+    local models=()
+    local model_name
+    local index=1
+
+    while IFS= read -r model_name; do
+        [[ -n "${model_name}" ]] || continue
+        models+=("${model_name}")
+    done < <(build_unique_models)
+
+    for model_name in "${models[@]}"; do
+        if ! pull_model_with_retry "${model_name}" "${#models[@]}" "${index}"; then
+            return 1
+        fi
+        index=$((index + 1))
+    done
+
+    return 0
+}
+
+choose_setup_mode() {
+    local choice
+    choice="$(prompt_with_timeout \
+        $'Quick setup or advanced setup?\n1. Quick (recommended)\n2. Advanced' \
+        "1")"
+    choice="$(normalize_menu_choice "${choice}")"
+    case "${choice}" in
+        1)
+            printf 'quick\n'
+            ;;
+        2)
+            printf 'advanced\n'
+            ;;
+        *)
+            log "Invalid choice. Defaulting to quick setup."
+            printf 'quick\n'
+            ;;
+    esac
+}
+
+choose_advanced_profile() {
+    local recommended_label="$1"
+    local choice
+    choice="$(prompt_with_timeout \
+        $'Select a model profile to install:\n1. Recommended\n2. Tiny (qwen2.5:0.5b for all roles)\n3. Balanced (qwen2.5:0.5b + qwen2.5:1.5b)\n4. Performance (qwen2.5:0.5b + qwen2.5:1.5b, same default roles)\n5. Skip setup' \
+        "1")"
+    choice="${choice,,}"
+    case "${choice}" in
+        1|recommended)
+            printf '%s\n' "${recommended_label}"
+            ;;
+        2|tiny)
+            printf 'tiny\n'
+            ;;
+        3|balanced)
+            printf 'balanced\n'
+            ;;
+        4|performance)
+            printf 'performance\n'
+            ;;
+        5|skip)
+            printf 'skip\n'
+            ;;
+        *)
+            log "Invalid choice. Defaulting to ${recommended_label}."
+            printf '%s\n' "${recommended_label}"
+            ;;
+    esac
+}
+
+finalize_successful_setup() {
+    log "Finalizing setup..."
+    write_model_config
+    validate_written_config
+    touch "${STAMP_FILE}"
+    systemctl start "${HEALTHCHECK_TRIGGER_SERVICE}" >/dev/null 2>&1 || true
+    log "Setup complete. AI environment is ready."
+    emit_stage "INSTALL_COMPLETE"
+}
+
+main() {
+    local ram_gb cpu_cores recommended_profile setup_mode selected_profile
+
+    detect_interactive_mode
+    ensure_dirs
+    setup_logging
+    trap log_unexpected_exit EXIT
+
+    if [[ "${INTERACTIVE}" -ne 1 ]]; then
+        log "Warning: non-interactive shell detected, using defaults."
+        emit_stage "NONINTERACTIVE_DEFAULTS"
+    fi
+
+    log "Detecting system hardware..."
+    ram_gb="$(detect_ram_gb)"
+    cpu_cores="$(detect_cpu_cores)"
+    log "Detected RAM: ${ram_gb} GB"
+    log "Detected CPU cores: ${cpu_cores}"
+
+    if config_is_complete && ensure_ollama_ready && models_installed; then
+        touch "${STAMP_FILE}"
+        systemctl start "${HEALTHCHECK_TRIGGER_SERVICE}" >/dev/null 2>&1 || true
+        log "Existing AI model setup detected."
+        log "Setup complete. AI environment is ready."
+        emit_stage "MODELS_ALREADY_PRESENT"
+        emit_stage "INSTALL_COMPLETE"
+        exit 0
+    fi
+
+    ensure_network_ready
+
+    if ! ensure_ollama_ready; then
+        log "Ollama is not ready. Connect to the network and rerun ai-os-installer."
+        emit_failure "OLLAMA_NOT_READY"
+        exit 0
+    fi
+
+    log "Recommending models..."
+    recommended_profile="$(recommend_profile "${ram_gb}")"
+    set_profile_models "${recommended_profile}"
+
+    setup_mode="$(choose_setup_mode)"
+    if [[ "${setup_mode}" == "advanced" ]]; then
+        selected_profile="$(choose_advanced_profile "${recommended_profile}")"
+        if [[ "${selected_profile}" == "skip" ]]; then
+            log "Setup skipped. Run ai-os-installer later to configure AI models."
+            emit_failure "SETUP_SKIPPED"
+            exit 0
+        fi
+        set_profile_models "${selected_profile}"
+    fi
+
+    print_profile_summary
+    if ! ensure_storage_capacity; then
+        exit 0
+    fi
+    if [[ "${NETWORK_READY}" -ne 1 ]]; then
+        log "Proceeding without verified internet access. Model installation may fail until networking is configured."
+    fi
+    log "Installing AI models..."
+    if ! run_model_install; then
+        log "Model installation was skipped before completion."
+        log "Run ai-os-installer after networking is available to finish setup."
+        if [[ "${FAILURE_MARKER_EMITTED}" -ne 1 ]]; then
+            emit_failure "MODEL_INSTALL_SKIPPED"
+        fi
+        exit 0
+    fi
+
+    finalize_successful_setup
+}
+
+main "$@"
