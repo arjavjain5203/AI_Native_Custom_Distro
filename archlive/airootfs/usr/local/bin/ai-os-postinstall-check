@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="/var/lib/ai-os"
+STAMP_FILE="${STATE_DIR}/postinstall-check-complete"
+LOG_FILE="/var/log/ai-os-installer.log"
+MAX_ATTEMPTS="${AI_OS_POSTINSTALL_HEALTH_ATTEMPTS:-15}"
+SLEEP_SECONDS="${AI_OS_POSTINSTALL_HEALTH_SLEEP:-2}"
+SERIAL_DEVICE="${AI_OS_INSTALLER_SERIAL_DEVICE:-/dev/ttyS0}"
+
+mkdir -p "${STATE_DIR}" "$(dirname "${LOG_FILE}")"
+touch "${LOG_FILE}"
+exec >> "${LOG_FILE}" 2>&1
+
+log() {
+    printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
+}
+
+emit_serial_line() {
+    local message="$1"
+    if [[ -c "${SERIAL_DEVICE}" && -w "${SERIAL_DEVICE}" ]]; then
+        printf '%s\n' "${message}" > "${SERIAL_DEVICE}" 2>/dev/null || true
+    fi
+}
+
+emit_stage() {
+    local stage="$1"
+    local marker="AIOS_STAGE:${stage}"
+    printf '%s\n' "${marker}"
+    emit_serial_line "${marker}"
+}
+
+log "Starting post-install AI daemon health check."
+emit_stage "HEALTHCHECK_START"
+
+for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
+    if /usr/local/bin/ai-os --health; then
+        touch "${STAMP_FILE}"
+        log "Post-install health check passed."
+        emit_stage "HEALTHCHECK_OK"
+        exit 0
+    fi
+
+    log "Health check attempt ${attempt}/${MAX_ATTEMPTS} failed. Retrying in ${SLEEP_SECONDS} seconds."
+    sleep "${SLEEP_SECONDS}"
+done
+
+log "Post-install health check failed after ${MAX_ATTEMPTS} attempts."
+emit_stage "INSTALL_FAILED:HEALTHCHECK_FAILED"
+exit 1
