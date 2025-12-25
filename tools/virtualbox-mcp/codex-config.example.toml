@@ -1,0 +1,5 @@
+[mcp_servers.virtualbox]
+command = "node"
+args = ["/home/arjavjain5203/Coding/AI_Native_Custom_Distro/tools/virtualbox-mcp/mcp-server.js"]
+startup_timeout_sec = 30
+tool_timeout_sec = 3600
