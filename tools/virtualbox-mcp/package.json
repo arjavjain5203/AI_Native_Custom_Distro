@@ -1,0 +1,15 @@
+{
+  "name": "virtualbox-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node mcp-server.js",
+    "check": "node --check mcp-server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.5",
+    "axios": "^1.13.0",
+    "zod": "^3.25.76"
+  }
+}
