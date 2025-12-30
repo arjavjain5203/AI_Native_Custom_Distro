@@ -62,6 +62,9 @@
           <AttachedDevice type="HardDisk" hotpluggable="false" port="0" device="0">
             <Image uuid="{6d8001e3-17ff-4111-a1d2-26b61f9890d7}"/>
           </AttachedDevice>
+          <AttachedDevice passthrough="false" type="DVD" hotpluggable="false" port="1" device="0">
+            <Image uuid="{25a6d806-8a29-4f30-bff1-71ed1973fef7}"/>
+          </AttachedDevice>
         </StorageController>
       </StorageControllers>
       <CPU count="8">
