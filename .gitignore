@@ -1,19 +1,56 @@
+# ──────────────────────────────────────────────
+# AI-Native Developer Operating Environment
+# .gitignore
+# ──────────────────────────────────────────────
+
+# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
 .venv/
 venv/
 env/
 
-*.db
-ai_core.db
+# Testing
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
+# Environment
+.env
+
+# Databases
+*.db
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
 out/
 archlive/work/
-node_modules/
 archiso-work/
 .*-work/
 .vm-test-work/
 *.iso
+
+# Node (if any frontend is added)
+node_modules/
