@@ -11,9 +11,10 @@ from pathlib import Path
 import re
 from typing import Any
 
+from ai_core.core.file_verifier import resolve_tool_targets, snapshot_paths, verify_path_mutations
 from ai_core.memory.vector_store import VectorStore
 from ai_core.models.manager import ModelManager
-from ai_core.tools import ToolExecutionError, list_files, run_shell_command, update_file, write_file
+from ai_core.tools import ToolExecutionContext, ToolExecutionError, ToolRegistry, build_tool_registry, list_files, run_shell_command
 
 
 MAX_RETRIES = 2
@@ -30,6 +31,9 @@ class CodingStepResult:
     diffs: dict[str, str]
     retrieved_files: list[str]
     validation: dict[str, Any]
+    actions: list[dict[str, Any]] = field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    model_response: str = ""
     error: str | None = None
     tests: dict[str, Any] = field(default_factory=dict)
 
@@ -39,9 +43,10 @@ class _EditGenerationResult:
     """Internal result for candidate edit generation and validation."""
 
     success: bool
-    edits: list[dict[str, str]]
+    actions: list[dict[str, Any]]
     validation: dict[str, Any]
     retries_used: int
+    raw_response: str = ""
     error: str | None = None
 
 
@@ -52,9 +57,11 @@ class CodingAgent:
         self,
         model_manager: ModelManager | None = None,
         vector_store: VectorStore | None = None,
+        tool_registry: ToolRegistry | None = None,
     ) -> None:
         self.model_manager = model_manager or ModelManager()
         self.vector_store = vector_store or VectorStore()
+        self.tool_registry = tool_registry or build_tool_registry()
 
     def execute_step(self, instruction: str, cwd: str, step_args: dict[str, Any]) -> CodingStepResult:
         self._validate_inputs(instruction, cwd, step_args)
@@ -90,6 +97,9 @@ class CodingAgent:
                 diffs={},
                 retrieved_files=retrieved_files,
                 validation=validation,
+                actions=[],
+                tool_calls=[],
+                model_response=generation.raw_response,
                 tests=tests,
             )
             self._validate_result(result)
@@ -97,29 +107,116 @@ class CodingAgent:
 
         changed_files: list[str] = []
         diffs: dict[str, str] = {}
-        for edit in generation.edits:
-            target_path = (repo_root / edit["path"]).resolve()
-            if not str(target_path).startswith(str(repo_root)):
-                raise ValueError(f"refusing to edit outside repository: {target_path}")
+        tool_calls: list[dict[str, Any]] = []
+        try:
+            for action in generation.actions:
+                tool_name, tool_args = self._action_to_tool(action)
+                target_paths = resolve_tool_targets(tool_name, tool_args, str(repo_root))
+                snapshots = snapshot_paths(target_paths)
+                old_content = ""
+                relative_path = self._action_display_path(action)
+                if relative_path:
+                    target_path = (repo_root / relative_path).resolve()
+                    if not str(target_path).startswith(str(repo_root)):
+                        raise ValueError(f"refusing to edit outside repository: {target_path}")
+                    if target_path.exists() and target_path.is_file():
+                        old_content = target_path.read_text(encoding="utf-8", errors="replace")
 
-            old_content = target_path.read_text(encoding="utf-8", errors="replace") if target_path.exists() else ""
-            new_content = edit["content"]
-            if target_path.exists():
-                update_file(target_path, new_content)
-            else:
-                write_file(target_path, new_content)
-
-            diff = "\n".join(
-                difflib.unified_diff(
-                    old_content.splitlines(),
-                    new_content.splitlines(),
-                    fromfile=f"a/{edit['path']}",
-                    tofile=f"b/{edit['path']}",
-                    lineterm="",
+                tool_result = self.tool_registry.execute(
+                    tool_name,
+                    tool_args,
+                    ToolExecutionContext(
+                        cwd=str(repo_root),
+                        metadata={"role": "coding", "tool_name": tool_name},
+                    ),
                 )
+                if not tool_result.success:
+                    raise ValueError(tool_result.error or f"coding tool execution failed: {tool_name}")
+                if tool_result.output is None or (isinstance(tool_result.output, str) and not tool_result.output.strip()):
+                    raise ValueError(f"coding tool execution returned no valid output: {tool_name}")
+
+                verification = verify_path_mutations(snapshots, cwd=str(repo_root))
+                modified_paths = verification["files_modified"]
+                if not modified_paths:
+                    raise ValueError(f"coding action '{tool_name}' produced no verified file changes")
+
+                for modified_path in modified_paths:
+                    if modified_path not in changed_files:
+                        changed_files.append(modified_path)
+
+                if relative_path:
+                    target_path = (repo_root / relative_path).resolve()
+                    if target_path.exists() and target_path.is_file():
+                        new_content = target_path.read_text(encoding="utf-8", errors="replace")
+                        diff = "\n".join(
+                            difflib.unified_diff(
+                                old_content.splitlines(),
+                                new_content.splitlines(),
+                                fromfile=f"a/{relative_path}",
+                                tofile=f"b/{relative_path}",
+                                lineterm="",
+                            )
+                        )
+                        if diff:
+                            diffs[relative_path] = diff
+
+                tool_calls.append(
+                    {
+                        "tool_name": tool_name,
+                        "args": tool_args,
+                        "output": tool_result.output,
+                        "verification": verification,
+                    }
+                )
+        except Exception as exc:
+            validation = self._finalize_validation(
+                repo_root=repo_root,
+                changed_files=[],
+                validation={
+                    **generation.validation,
+                    "errors": list(generation.validation.get("errors", [])) + [str(exc)],
+                },
+                retries_used=generation.retries_used,
             )
-            changed_files.append(edit["path"])
-            diffs[edit["path"]] = diff
+            result = CodingStepResult(
+                success=False,
+                error=str(exc),
+                changed_files=[],
+                diffs={},
+                retrieved_files=retrieved_files,
+                validation=validation,
+                actions=generation.actions,
+                tool_calls=tool_calls,
+                model_response=generation.raw_response,
+                tests=tests,
+            )
+            self._validate_result(result)
+            return result
+
+        if not changed_files:
+            validation = self._finalize_validation(
+                repo_root=repo_root,
+                changed_files=[],
+                validation={
+                    **generation.validation,
+                    "errors": list(generation.validation.get("errors", [])) + ["no verified file changes detected"],
+                },
+                retries_used=generation.retries_used,
+            )
+            result = CodingStepResult(
+                success=False,
+                error="No verified file changes detected",
+                changed_files=[],
+                diffs={},
+                retrieved_files=retrieved_files,
+                validation=validation,
+                actions=generation.actions,
+                tool_calls=tool_calls,
+                model_response=generation.raw_response,
+                tests=tests,
+            )
+            self._validate_result(result)
+            return result
 
         validation = self._finalize_validation(
             repo_root=repo_root,
@@ -134,6 +231,9 @@ class CodingAgent:
             diffs=diffs,
             retrieved_files=retrieved_files,
             validation=validation,
+            actions=generation.actions,
+            tool_calls=tool_calls,
+            model_response=generation.raw_response,
             tests=tests,
         )
         self._validate_result(result)
@@ -155,13 +255,20 @@ Relevant context:
 
 Return JSON only in this format:
 {{
-  "edits": [
+  "actions": [
     {{
-      "path": "relative/path.py",
+      "action": "edit_file",
+      "file": "relative/path.py",
       "content": "full new file contents"
     }}
   ]
 }}
+
+Rules:
+- Do not return prose.
+- Use only action names: create_file, edit_file, create_folder.
+- Every requested code change must be expressed through actions.
+- If you do not intend to modify a file or folder, return an empty actions array.
 """.strip()
 
     def _build_correction_prompt(
@@ -189,23 +296,37 @@ Do not explain.
 """.strip()
 
     @staticmethod
-    def _parse_edits(response: str) -> list[dict[str, str]]:
+    def _parse_edits(response: str) -> list[dict[str, Any]]:
         payload = json.loads(response)
-        edits = payload.get("edits", [])
-        if not isinstance(edits, list):
-            raise ValueError("coding response must contain an edits list")
+        actions = payload.get("actions", [])
+        if not isinstance(actions, list):
+            raise ValueError("coding response must contain an actions list")
 
-        normalized: list[dict[str, str]] = []
-        for edit in edits:
-            if not isinstance(edit, dict):
-                raise ValueError("each edit must be an object")
-            path = edit.get("path")
-            content = edit.get("content")
-            if not isinstance(path, str) or not path.strip():
-                raise ValueError("edit path must be a non-empty string")
-            if not isinstance(content, str):
-                raise ValueError("edit content must be a string")
-            normalized.append({"path": path.strip(), "content": content})
+        normalized: list[dict[str, Any]] = []
+        for action in actions:
+            if not isinstance(action, dict):
+                raise ValueError("each action must be an object")
+            action_name = action.get("action")
+            if not isinstance(action_name, str) or not action_name.strip():
+                raise ValueError("action name must be a non-empty string")
+            normalized_action = {"action": action_name.strip()}
+            if action_name in {"create_file", "edit_file"}:
+                path = action.get("file")
+                content = action.get("content")
+                if not isinstance(path, str) or not path.strip():
+                    raise ValueError(f"{action_name} requires a non-empty 'file' value")
+                if not isinstance(content, str):
+                    raise ValueError(f"{action_name} requires a string 'content' value")
+                normalized_action["file"] = path.strip()
+                normalized_action["content"] = content
+            elif action_name == "create_folder":
+                path = action.get("path")
+                if not isinstance(path, str) or not path.strip():
+                    raise ValueError("create_folder requires a non-empty 'path' value")
+                normalized_action["path"] = path.strip()
+            else:
+                raise ValueError(f"unsupported coding action: {action_name}")
+            normalized.append(normalized_action)
         return normalized
 
     def _generate_validated_edits(
@@ -232,7 +353,7 @@ Do not explain.
         for attempt in range(MAX_RETRIES + 1):
             last_response = self.model_manager.run_model(model_name, prompt, task_type="coding")
             try:
-                edits = self._parse_edits(last_response)
+                actions = self._parse_edits(last_response)
             except (json.JSONDecodeError, ValueError) as exc:
                 last_errors = [str(exc)]
                 last_validation = {
@@ -253,14 +374,35 @@ Do not explain.
                 )
                 continue
 
-            validation = self._validate_candidate_edits(repo_root, edits)
+            if not actions:
+                last_errors = ["coding response did not include any actionable tool calls"]
+                last_validation = {
+                    "syntax_ok": False,
+                    "imports_ok": True,
+                    "python_files_checked": [],
+                    "errors": list(last_errors),
+                    "warnings": [],
+                }
+                if attempt == MAX_RETRIES:
+                    break
+                prompt = self._build_correction_prompt(
+                    instruction,
+                    retrieved,
+                    indexed_count,
+                    last_response,
+                    last_errors,
+                )
+                continue
+
+            validation = self._validate_candidate_edits(repo_root, actions)
             last_validation = validation
             if validation["syntax_ok"]:
                 return _EditGenerationResult(
                     success=True,
-                    edits=edits,
+                    actions=actions,
                     validation=validation,
                     retries_used=attempt,
+                    raw_response=last_response,
                 )
 
             last_errors = list(validation["errors"])
@@ -270,31 +412,33 @@ Do not explain.
                 instruction,
                 retrieved,
                 indexed_count,
-                json.dumps({"edits": edits}, indent=2),
+                json.dumps({"actions": actions}, indent=2),
                 last_errors,
             )
 
         return _EditGenerationResult(
             success=False,
-            edits=[],
+            actions=[],
             validation=last_validation,
             retries_used=MAX_RETRIES,
+            raw_response=last_response,
             error="Validation failed after retries",
         )
 
-    def _validate_candidate_edits(self, repo_root: Path, edits: list[dict[str, str]]) -> dict[str, Any]:
+    def _validate_candidate_edits(self, repo_root: Path, actions: list[dict[str, Any]]) -> dict[str, Any]:
         syntax_errors: list[str] = []
         warnings: list[str] = []
         python_files_checked: list[str] = []
-        local_module_roots = self._discover_local_module_roots(repo_root, edits)
+        file_actions = [action for action in actions if action["action"] in {"create_file", "edit_file"}]
+        local_module_roots = self._discover_local_module_roots(repo_root, file_actions)
 
-        for edit in edits:
-            relative_path = edit["path"]
+        for action in file_actions:
+            relative_path = str(action["file"])
             if not relative_path.endswith(".py"):
                 continue
             python_files_checked.append(relative_path)
             try:
-                tree = ast.parse(edit["content"], filename=relative_path)
+                tree = ast.parse(str(action["content"]), filename=relative_path)
             except SyntaxError as exc:
                 syntax_errors.append(self._format_syntax_error(relative_path, exc))
                 continue
@@ -304,7 +448,7 @@ Do not explain.
                     tree=tree,
                     relative_path=relative_path,
                     repo_root=repo_root,
-                    edits=edits,
+                    edits=file_actions,
                     local_module_roots=local_module_roots,
                 )
             )
@@ -337,7 +481,7 @@ Do not explain.
         tree: ast.AST,
         relative_path: str,
         repo_root: Path,
-        edits: list[dict[str, str]],
+        edits: list[dict[str, Any]],
         local_module_roots: set[str],
     ) -> list[str]:
         collector = _PythonNameCollector()
@@ -367,7 +511,7 @@ Do not explain.
         return f"{relative_path}: syntax error at line {line}, column {offset}: {message}"
 
     @staticmethod
-    def _discover_local_module_roots(repo_root: Path, edits: list[dict[str, str]]) -> set[str]:
+    def _discover_local_module_roots(repo_root: Path, edits: list[dict[str, Any]]) -> set[str]:
         roots: set[str] = set()
         for file_path in repo_root.glob("*.py"):
             roots.add(file_path.stem)
@@ -375,7 +519,7 @@ Do not explain.
             if directory.is_dir() and (directory / "__init__.py").exists():
                 roots.add(directory.name)
         for edit in edits:
-            path = Path(edit["path"])
+            path = Path(str(edit["file"]))
             parts = path.parts
             if not parts:
                 continue
@@ -386,10 +530,10 @@ Do not explain.
         return roots
 
     @staticmethod
-    def _module_exists_locally(repo_root: Path, module_name: str, edits: list[dict[str, str]]) -> bool:
+    def _module_exists_locally(repo_root: Path, module_name: str, edits: list[dict[str, Any]]) -> bool:
         module_path = Path(*module_name.split("."))
         candidate_files = {
-            Path(edit["path"]).as_posix()
+            Path(str(edit["file"])).as_posix()
             for edit in edits
         }
         module_file = module_path.with_suffix(".py").as_posix()
@@ -465,6 +609,12 @@ Do not explain.
             raise ValueError("coding result retrieved_files must be a list")
         if not isinstance(result.validation, dict):
             raise ValueError("coding result validation must be an object")
+        if not isinstance(result.actions, list):
+            raise ValueError("coding result actions must be a list")
+        if not isinstance(result.tool_calls, list):
+            raise ValueError("coding result tool_calls must be a list")
+        if not isinstance(result.model_response, str):
+            raise ValueError("coding result model_response must be a string")
         if result.error is not None and not isinstance(result.error, str):
             raise ValueError("coding result error must be a string or null")
         if not isinstance(result.tests, dict):
@@ -477,6 +627,25 @@ Do not explain.
             "passed": False,
             "failures": [],
         }
+
+    @staticmethod
+    def _action_to_tool(action: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        action_name = str(action["action"])
+        if action_name == "create_file":
+            return "create_file", {"path": str(action["file"]), "content": str(action["content"])}
+        if action_name == "edit_file":
+            return "update_file", {"path": str(action["file"]), "content": str(action["content"])}
+        if action_name == "create_folder":
+            return "create_folder", {"path": str(action["path"])}
+        raise ValueError(f"unsupported coding action: {action_name}")
+
+    @staticmethod
+    def _action_display_path(action: dict[str, Any]) -> str | None:
+        if "file" in action:
+            return str(action["file"])
+        if "path" in action:
+            return str(action["path"])
+        return None
 
 
 class _PythonNameCollector(ast.NodeVisitor):
