@@ -11,11 +11,22 @@ from ai_core.core.approvals import ApprovalStore
 from ai_core.core.rollback import RollbackManager
 from ai_core.core.session import SessionManager
 from ai_core.core.step_runner import StepRunner
-from ai_core.core.types import ExecutionOutcome, ExecutionState, PlanStep, TaskResult
+from ai_core.core.types import ExecutionOutcome, ExecutionState, PlanStep, PlanningResult, TaskResult
 from ai_core.memory import TaskHistoryStore, VectorStore, WorkingMemoryStore
+from ai_core.models.download_manager import ModelDownloadManager
+from ai_core.models.manager import ModelManager, ModelManagerError, ModelState
 from ai_core.models.orchestrator import Orchestrator
 from ai_core.models.router import ModelRouter
 from ai_core.tools import ToolRegistry
+
+ORCHESTRATOR_MISSING_MESSAGE = (
+    "Orchestrator model is not installed yet. Please wait while it is downloading. "
+    "You can continue using normal terminal commands."
+)
+DOWNLOAD_MESSAGE_TEMPLATE = "Model {name} is downloading. You can run basic tasks."
+FALLBACK_MESSAGE = "Using a smaller model because the preferred model is still downloading."
+BLOCK_MESSAGE = "This task requires a more capable model. Please wait for the model to finish downloading."
+FAILED_INSTALL_MESSAGE = "Required model failed to install. Please retry installation."
 
 
 class ExecutionEngine:
@@ -37,6 +48,8 @@ class ExecutionEngine:
         vector_store: VectorStore | None = None,
         tool_registry: ToolRegistry | None = None,
         step_runner: StepRunner | None = None,
+        model_manager: ModelManager | None = None,
+        download_manager: ModelDownloadManager | None = None,
     ) -> None:
         self.router = router
         self.planner = planner
@@ -45,6 +58,8 @@ class ExecutionEngine:
         self.vector_store = vector_store or VectorStore()
         self.working_memory_store = working_memory_store
         self.session_manager = session_manager
+        self.model_manager = model_manager or getattr(router, "model_manager", None) or getattr(planner, "model_manager", None)
+        self.download_manager = download_manager
         self.step_runner = step_runner or StepRunner(
             executor=executor,
             coding_agent=coding_agent,
@@ -62,72 +77,123 @@ class ExecutionEngine:
         task_id = f"task-{uuid4().hex[:8]}"
         result: TaskResult
         created_state = False
+        parent_task_id: str | None = None
 
         try:
             routing_context = self._build_routing_context(cwd, command)
             parent_task_id = self._resolve_parent_task_id(command, routing_context)
-            decision = self.router.classify(command, routing_context, session_id=cwd)
-            routing = asdict(self.router.selection_for_decision(decision))
-            routing["mode"] = decision.get("mode")
-            routing["confidence"] = decision.get("confidence")
 
-            if decision.get("mode") == "conversation":
-                result = self._build_conversation_result(command, cwd, routing)
+            orchestrator_gate = self._guard_orchestrator()
+            if orchestrator_gate is not None:
+                result = orchestrator_gate
                 self._update_session_task_state(
                     cwd,
-                    status="conversation",
-                    task_type=str(routing.get("task_type", "planning")),
-                    agent=str(routing.get("role", "planning")),
+                    status="failed",
+                    task_type="planning",
+                    agent="planning",
                     active_command=command,
+                    task_id=task_id,
                 )
             else:
-                planning_result = self.planner.plan_task(command)
-                state = ExecutionState(
-                    task_id=task_id,
-                    command=command,
-                    cwd=cwd,
-                    steps=list(planning_result.steps),
-                    step_index=0,
-                    step_results=[],
-                    routing=routing,
-                    planning_metadata={
-                        "source": planning_result.source,
-                        "validation": planning_result.validation,
-                    },
-                    context={
-                        **dict(context),
-                        "parent_task_id": parent_task_id,
-                    },
-                    status="running",
-                )
-                self._store_execution_state(state)
-                self._update_session_task_state(
-                    cwd,
-                    status="running",
-                    task_type=str(routing.get("task_type", "planning")),
-                    agent=str(routing.get("role", "planning")),
-                    active_command=command,
-                    task_id=task_id,
-                )
-                created_state = True
-                if state.steps:
-                    self.history_store.record_scratchpad(
-                        task_id=task_id,
-                        step_index=0,
-                        category="validation",
-                        payload={
-                            "planning_source": planning_result.source,
-                            "planning_validation": planning_result.validation,
-                        },
+                decision = self.router.classify(command, routing_context, session_id=cwd)
+                routing = asdict(self.router.selection_for_decision(decision))
+                routing["mode"] = decision.get("mode")
+                routing["confidence"] = decision.get("confidence")
+
+                if decision.get("mode") == "conversation":
+                    result = self._build_conversation_result(command, cwd, routing)
+                    self._update_session_task_state(
+                        cwd,
+                        status="conversation",
+                        task_type=str(routing.get("task_type", "planning")),
+                        agent=str(routing.get("role", "planning")),
+                        active_command=command,
                     )
-                result = self._run_plan(state)
-        except (ValueError, RuntimeError) as exc:
+                else:
+                    planning_result, model_notices, planning_block = self._plan_with_lifecycle(command)
+                    if planning_block is not None or planning_result is None:
+                        result = planning_block or self._build_lifecycle_failure(
+                            message=BLOCK_MESSAGE,
+                            errors=[{"message": BLOCK_MESSAGE, "type": "model_unavailable"}],
+                            routing=routing,
+                        )
+                        self._update_session_task_state(
+                            cwd,
+                            status="failed",
+                            task_type=str(routing.get("task_type", "planning")),
+                            agent=str(routing.get("role", "planning")),
+                            active_command=command,
+                            task_id=task_id,
+                        )
+                    else:
+                        task_complexity = "simple" if self._is_simple_task(planning_result.steps) else "complex"
+                        state = ExecutionState(
+                            task_id=task_id,
+                            command=command,
+                            cwd=cwd,
+                            steps=list(planning_result.steps),
+                            step_index=0,
+                            step_results=[],
+                            files_modified=[],
+                            steps_completed=[],
+                            errors=[],
+                            routing=routing,
+                            planning_metadata={
+                                "source": planning_result.source,
+                                "validation": planning_result.validation,
+                            },
+                            context={
+                                **dict(context),
+                                "parent_task_id": parent_task_id,
+                                "task_complexity": task_complexity,
+                                "model_notices": list(model_notices),
+                            },
+                            status="running",
+                        )
+                        self._store_execution_state(state)
+                        self._update_session_task_state(
+                            cwd,
+                            status="running",
+                            task_type=str(routing.get("task_type", "planning")),
+                            agent=str(routing.get("role", "planning")),
+                            active_command=command,
+                            task_id=task_id,
+                        )
+                        created_state = True
+                        if state.steps:
+                            self.history_store.record_scratchpad(
+                                task_id=task_id,
+                                step_index=0,
+                                category="model_response",
+                                payload={
+                                    "routing_decision": decision,
+                                    "planner_steps": self._serialize_plan_steps(state.steps),
+                                },
+                            )
+                            self.history_store.record_scratchpad(
+                                task_id=task_id,
+                                step_index=0,
+                                category="validation",
+                                payload={
+                                    "planning_source": planning_result.source,
+                                    "planning_validation": planning_result.validation,
+                                    "task_complexity": task_complexity,
+                                    "model_notices": list(model_notices),
+                                },
+                            )
+                        result = self._run_plan(state)
+        except (ValueError, RuntimeError, ModelManagerError) as exc:
             result = TaskResult(
                 success=False,
                 message=str(exc),
-                data={"status": "failed", "error_type": "runtime_error"},
+                data={
+                    "status": "failed",
+                    "error_type": "runtime_error",
+                    "files_modified": [],
+                    "steps_completed": [],
+                    "errors": [{"message": str(exc), "type": "runtime_error"}],
+                },
             )
-            parent_task_id = None
 
         self.history_store.record_task(
             task_id,
@@ -181,6 +247,10 @@ class ExecutionEngine:
                     "status": "cancelled",
                     "routing": state.routing,
                     "step_results": list(state.step_results),
+                    "files_modified": list(state.files_modified),
+                    "steps_completed": list(state.steps_completed),
+                    "errors": list(state.errors),
+                    "model_notices": list(state.context.get("model_notices", [])),
                 },
             )
         else:
@@ -206,13 +276,30 @@ class ExecutionEngine:
         )
 
     def _run_plan(self, state: ExecutionState) -> TaskResult:
+        task_is_simple = str(state.context.get("task_complexity", "complex")) == "simple"
+
         for index in range(state.step_index, len(state.steps)):
             state.step_index = index
             state.status = "running"
             self._store_execution_state(state)
 
             step = state.steps[index]
-            step_result = self.step_runner.run(state, step)
+            execution_step, block_result = self._prepare_step_for_execution(step, task_is_simple, state)
+            if block_result is not None:
+                state.status = "failed"
+                self._store_execution_state(state)
+                self._update_session_task_state(
+                    state.cwd,
+                    status="failed",
+                    task_type=str(state.routing.get("task_type", "planning")),
+                    agent=str(state.routing.get("role", "planning")),
+                    active_command=state.command,
+                    task_id=state.task_id,
+                )
+                return self._merge_state_into_result(state, block_result)
+            state.steps[index] = execution_step
+
+            step_result = self.step_runner.run(state, execution_step)
 
             if step_result.status == "pending_approval":
                 state.status = "pending_approval"
@@ -233,14 +320,39 @@ class ExecutionEngine:
                         "status": "pending_approval",
                         "routing": state.routing,
                         "step_results": list(state.step_results),
+                        "files_modified": list(state.files_modified),
+                        "steps_completed": list(state.steps_completed),
+                        "errors": list(state.errors),
+                        "model_notices": list(state.context.get("model_notices", [])),
                         "approval_request": asdict(step_result.approval_request),
                     },
                 )
 
             if step_result.step_result_entry:
                 state.step_results.append(step_result.step_result_entry)
+            if step_result.status == "completed":
+                state.steps_completed.append(
+                    {
+                        "step_index": index,
+                        "step": step.description,
+                        "role": step.role,
+                        "tool_name": step.tool_name,
+                    }
+                )
+            for modified_path in step_result.files_modified:
+                if modified_path not in state.files_modified:
+                    state.files_modified.append(modified_path)
 
             if step_result.status == "failed":
+                state.errors.append(
+                    {
+                        "step_index": index,
+                        "step": step.description,
+                        "role": step.role,
+                        "tool_name": step.tool_name,
+                        "message": str(step_result.result.get("error", "")) if isinstance(step_result.result, dict) else "",
+                    }
+                )
                 state.status = "failed"
                 self._store_execution_state(state)
                 self._update_session_task_state(
@@ -259,8 +371,12 @@ class ExecutionEngine:
                         "status": "failed",
                         "routing": state.routing,
                         "step_results": list(state.step_results),
+                        "files_modified": list(state.files_modified),
+                        "steps_completed": list(state.steps_completed),
+                        "errors": list(state.errors),
                         "failed_step_index": index,
                         "failure_analysis": step_result.failure_analysis or {},
+                        "model_notices": list(state.context.get("model_notices", [])),
                     },
                 )
 
@@ -275,14 +391,19 @@ class ExecutionEngine:
             active_command=state.command,
             task_id=state.task_id,
         )
+        notices = list(state.context.get("model_notices", []))
         return TaskResult(
             success=True,
-            message="Task completed successfully.",
+            message=notices[-1] if notices else "Task completed successfully.",
             steps=state.steps,
             data={
                 "status": "completed",
                 "routing": state.routing,
                 "step_results": list(state.step_results),
+                "files_modified": list(state.files_modified),
+                "steps_completed": list(state.steps_completed),
+                "errors": list(state.errors),
+                "model_notices": notices,
             },
         )
 
@@ -292,6 +413,282 @@ class ExecutionEngine:
             **self.session_manager.get_context(cwd),
             "related_tasks": self.vector_store.get_related_tasks(command, cwd, limit=3),
         }
+
+    def _guard_orchestrator(self) -> TaskResult | None:
+        if self.model_manager is None:
+            return None
+
+        role = "orchestrator"
+        state = self.model_manager.get_model_state(role)
+        model_name = self.model_manager.get_model_name_for_role(role)
+        if state == ModelState.INSTALLED:
+            return None
+        if state == ModelState.NOT_INSTALLED:
+            self._enqueue_download(role)
+            return self._build_lifecycle_failure(
+                message=ORCHESTRATOR_MISSING_MESSAGE,
+                role=role,
+                model_name=model_name,
+                model_state=ModelState.DOWNLOADING,
+                notices=[self._download_message(model_name)],
+            )
+        if state == ModelState.DOWNLOADING:
+            return self._build_lifecycle_failure(
+                message=ORCHESTRATOR_MISSING_MESSAGE,
+                role=role,
+                model_name=model_name,
+                model_state=state,
+                notices=[self._download_message(model_name)],
+            )
+        return self._build_lifecycle_failure(
+            message=FAILED_INSTALL_MESSAGE,
+            role=role,
+            model_name=model_name,
+            model_state=state,
+            errors=[{"message": FAILED_INSTALL_MESSAGE, "type": "model_install_failed"}],
+        )
+
+    def _plan_with_lifecycle(self, command: str) -> tuple[PlanningResult | None, list[str], TaskResult | None]:
+        notices: list[str] = []
+        planning_role = "planning"
+        model_role = planning_role
+
+        if self.model_manager is not None:
+            state = self.model_manager.get_model_state(planning_role)
+            model_name = self.model_manager.get_model_name_for_role(planning_role)
+            if state == ModelState.FAILED:
+                return None, notices, self._build_lifecycle_failure(
+                    message=FAILED_INSTALL_MESSAGE,
+                    role=planning_role,
+                    model_name=model_name,
+                    model_state=state,
+                    errors=[{"message": FAILED_INSTALL_MESSAGE, "type": "model_install_failed"}],
+                )
+            if state in {ModelState.NOT_INSTALLED, ModelState.DOWNLOADING}:
+                if state == ModelState.NOT_INSTALLED:
+                    self._enqueue_download(planning_role)
+                notices.extend([self._download_message(model_name), FALLBACK_MESSAGE])
+                model_role = "orchestrator"
+
+        planning_result = self._invoke_planner(command, model_role=model_role)
+        if model_role == "orchestrator" and not self._is_simple_task(planning_result.steps):
+            return None, notices, self._build_lifecycle_failure(
+                message=BLOCK_MESSAGE,
+                role=planning_role,
+                model_name=self._model_name_for_role(planning_role),
+                model_state=self._model_state_for_role(planning_role),
+                notices=notices,
+                errors=[{"message": BLOCK_MESSAGE, "type": "model_unavailable"}],
+            )
+        return planning_result, notices, None
+
+    def _prepare_step_for_execution(
+        self,
+        step: PlanStep,
+        task_is_simple: bool,
+        state: ExecutionState,
+    ) -> tuple[PlanStep, TaskResult | None]:
+        execution_step = PlanStep(
+            description=step.description,
+            role=step.role,
+            tool_name=step.tool_name,
+            args=dict(step.args),
+            needs_retrieval=step.needs_retrieval,
+            requires_approval=step.requires_approval,
+            approval_category=step.approval_category,
+        )
+        if self.model_manager is None or step.role not in {"analysis", "coding"}:
+            return execution_step, None
+
+        role = "analysis" if step.role == "analysis" else "coding"
+        lifecycle = self._resolve_role_execution(role, task_is_simple=task_is_simple)
+        if lifecycle["block"]:
+            return execution_step, self._build_lifecycle_failure(
+                message=str(lifecycle["message"]),
+                role=role,
+                model_name=str(lifecycle["model_name"]),
+                model_state=lifecycle["state"],
+                notices=list(lifecycle["notices"]),
+                errors=[{"message": str(lifecycle["message"]), "type": "model_unavailable"}],
+                routing=state.routing,
+                step_results=list(state.step_results),
+                files_modified=list(state.files_modified),
+                steps_completed=list(state.steps_completed),
+                existing_errors=list(state.errors),
+            )
+        override = lifecycle["fallback_role"]
+        if isinstance(override, str):
+            execution_step.args["_model_role_override"] = override
+        self._append_model_notices(state, list(lifecycle["notices"]))
+        return execution_step, None
+
+    def _resolve_role_execution(self, role: str, *, task_is_simple: bool) -> dict[str, Any]:
+        state = self._model_state_for_role(role)
+        model_name = self._model_name_for_role(role)
+        notices: list[str] = []
+
+        if state == ModelState.INSTALLED:
+            return {
+                "block": False,
+                "message": "",
+                "fallback_role": None,
+                "state": state,
+                "model_name": model_name,
+                "notices": notices,
+            }
+
+        if state == ModelState.NOT_INSTALLED:
+            self._enqueue_download(role)
+            state = ModelState.DOWNLOADING
+
+        if state == ModelState.FAILED:
+            return {
+                "block": True,
+                "message": FAILED_INSTALL_MESSAGE,
+                "fallback_role": None,
+                "state": state,
+                "model_name": model_name,
+                "notices": notices,
+            }
+
+        notices.append(self._download_message(model_name))
+        if role == "coding":
+            return {
+                "block": True,
+                "message": BLOCK_MESSAGE,
+                "fallback_role": None,
+                "state": state,
+                "model_name": model_name,
+                "notices": notices,
+            }
+
+        if task_is_simple:
+            notices.append(FALLBACK_MESSAGE)
+            return {
+                "block": False,
+                "message": FALLBACK_MESSAGE,
+                "fallback_role": "orchestrator",
+                "state": state,
+                "model_name": model_name,
+                "notices": notices,
+            }
+
+        return {
+            "block": True,
+            "message": BLOCK_MESSAGE,
+            "fallback_role": None,
+            "state": state,
+            "model_name": model_name,
+            "notices": notices,
+        }
+
+    def _invoke_planner(self, command: str, *, model_role: str) -> PlanningResult:
+        try:
+            return self.planner.plan_task(command, model_role=model_role)
+        except TypeError:
+            return self.planner.plan_task(command)
+
+    def _enqueue_download(self, role: str) -> None:
+        if self.download_manager is None:
+            return
+        try:
+            self.download_manager.ensure_role_queued(role)
+        except RuntimeError:
+            return
+
+    def _append_model_notices(self, state: ExecutionState, notices: list[str]) -> None:
+        existing = list(state.context.get("model_notices", []))
+        for notice in notices:
+            if notice not in existing:
+                existing.append(notice)
+        state.context["model_notices"] = existing
+
+    def _model_state_for_role(self, role: str) -> ModelState:
+        if self.model_manager is None:
+            return ModelState.INSTALLED
+        return self.model_manager.get_model_state(role)
+
+    def _model_name_for_role(self, role: str) -> str:
+        if self.model_manager is None:
+            return role
+        return self.model_manager.get_model_name_for_role(role)
+
+    @staticmethod
+    def _download_message(model_name: str) -> str:
+        return DOWNLOAD_MESSAGE_TEMPLATE.format(name=model_name)
+
+    @staticmethod
+    def _is_simple_task(steps: list[PlanStep]) -> bool:
+        if len(steps) > 3:
+            return False
+        for step in steps:
+            if step.role == "coding":
+                return False
+            if step.needs_retrieval:
+                return False
+            if step.requires_approval:
+                return False
+        return True
+
+    @staticmethod
+    def _build_lifecycle_failure(
+        *,
+        message: str,
+        role: str | None = None,
+        model_name: str | None = None,
+        model_state: ModelState | None = None,
+        notices: list[str] | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        routing: dict[str, Any] | None = None,
+        step_results: list[dict[str, Any]] | None = None,
+        files_modified: list[str] | None = None,
+        steps_completed: list[dict[str, Any]] | None = None,
+        existing_errors: list[dict[str, Any]] | None = None,
+    ) -> TaskResult:
+        public_role = "intent" if role == "orchestrator" else role
+        payload_errors = list(existing_errors or [])
+        if errors is not None:
+            payload_errors.extend(errors)
+        elif message:
+            payload_errors.append({"message": message, "type": "model_unavailable"})
+        data: dict[str, Any] = {
+            "status": "failed",
+            "routing": routing or {},
+            "step_results": list(step_results or []),
+            "files_modified": list(files_modified or []),
+            "steps_completed": list(steps_completed or []),
+            "errors": payload_errors,
+            "model_notices": list(notices or []),
+            "blocked": True,
+            "error_type": "model_unavailable",
+        }
+        if public_role is not None:
+            data["role"] = public_role
+        if model_name is not None:
+            data["model_name"] = model_name
+        if model_state is not None:
+            data["model_state"] = model_state.value
+        return TaskResult(success=False, message=message, data=data)
+
+    @staticmethod
+    def _merge_state_into_result(state: ExecutionState, result: TaskResult) -> TaskResult:
+        payload = dict(result.data)
+        model_notices = list(state.context.get("model_notices", []))
+        for notice in payload.get("model_notices", []):
+            if notice not in model_notices:
+                model_notices.append(notice)
+        payload["routing"] = dict(state.routing)
+        payload["step_results"] = list(state.step_results)
+        payload["files_modified"] = list(state.files_modified)
+        payload["steps_completed"] = list(state.steps_completed)
+        payload["errors"] = list(payload.get("errors", state.errors))
+        payload["model_notices"] = model_notices
+        return TaskResult(
+            success=result.success,
+            message=result.message,
+            steps=state.steps,
+            data=payload,
+        )
 
     @staticmethod
     def _resolve_parent_task_id(command: str, routing_context: dict[str, Any]) -> str | None:
@@ -379,6 +776,10 @@ class ExecutionEngine:
             data={
                 "status": "completed",
                 "routing": routing,
+                "files_modified": [],
+                "steps_completed": [],
+                "errors": [],
+                "model_notices": [],
                 "conversation": {
                     "mode": "conversation",
                     "agent": role,
@@ -398,6 +799,9 @@ class ExecutionEngine:
                 "routing": dict(state.routing),
                 "planning_metadata": dict(state.planning_metadata),
                 "step_results": list(state.step_results),
+                "files_modified": list(state.files_modified),
+                "steps_completed": list(state.steps_completed),
+                "errors": list(state.errors),
             },
             step_index=state.step_index,
             status=state.status,
@@ -434,6 +838,9 @@ class ExecutionEngine:
             steps=list(state.steps),
             step_index=state.step_index,
             step_results=list(state.step_results),
+            files_modified=list(state.files_modified),
+            steps_completed=list(state.steps_completed),
+            errors=list(state.errors),
             routing=dict(state.routing),
             planning_metadata=dict(state.planning_metadata),
             context=dict(state.context),
