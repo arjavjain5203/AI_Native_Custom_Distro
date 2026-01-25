@@ -7,6 +7,7 @@ from typing import Any
 
 from ai_core.agents import AnalysisAgent, CodingAgent, ExecutorAgent
 from ai_core.core.approvals import ApprovalStore
+from ai_core.core.file_verifier import is_filesystem_mutating_tool, resolve_tool_targets, snapshot_paths, verify_path_mutations
 from ai_core.core.rollback import RollbackManager
 from ai_core.core.types import ExecutionState, PlanStep, StepRunResult
 from ai_core.memory.store import TaskHistoryStore
@@ -104,6 +105,8 @@ class StepRunner:
             try:
                 step_output = self._dispatch_step(step, state.cwd, tool_definition=tool_definition)
                 output_payload = self._normalize_payload(step_output)
+                files_modified = self._extract_files_modified(step, output_payload)
+                verification = self._extract_verification(output_payload)
                 if step.role == "coding" and output_payload.get("success") is False:
                     self.history_store.record_execution_log(
                         task_id=state.task_id,
@@ -119,10 +122,43 @@ class StepRunner:
                         category="tool_output",
                         payload=output_payload,
                     )
-                    return self._build_failure_result(
+                    failure_result = self._build_failure_result(
                         state=state,
                         step=step,
                         error=str(output_payload.get("error") or "coding step failed"),
+                        attempt=attempt,
+                    )
+                    failure_result.step_result_entry = {
+                        "step": step.description,
+                        "role": step.role,
+                        "tool_name": step.tool_name,
+                        "result": output_payload,
+                    }
+                    return failure_result
+                if self._requires_verified_mutation(step, tool_definition) and not files_modified:
+                    error = "no verified file changes detected"
+                    self.history_store.record_execution_log(
+                        task_id=state.task_id,
+                        step_index=step_index,
+                        role=step.role,
+                        tool_name=step.tool_name,
+                        status="failed",
+                        payload={
+                            "error": error,
+                            "output": output_payload,
+                            "verification": verification,
+                        },
+                    )
+                    self.history_store.record_scratchpad(
+                        task_id=state.task_id,
+                        step_index=step_index,
+                        category="validation",
+                        payload={"verification": verification, "files_modified": files_modified},
+                    )
+                    return self._build_failure_result(
+                        state=state,
+                        step=step,
+                        error=error,
                         attempt=attempt,
                     )
                 self.history_store.record_execution_log(
@@ -144,6 +180,8 @@ class StepRunner:
                     step_index=step_index,
                     step=step,
                     result=step_output,
+                    files_modified=files_modified,
+                    verification=verification,
                     step_result_entry={
                         "step": step.description,
                         "role": step.role,
@@ -179,10 +217,14 @@ class StepRunner:
 
     def _dispatch_step(self, step: PlanStep, cwd: str, *, tool_definition: ToolDefinition | None) -> Any:
         instruction = str(step.args.get("instruction", step.description))
+        model_role_overrides = step.args.get("_model_role_override")
+        if model_role_overrides is not None and not isinstance(model_role_overrides, str):
+            raise ValueError("step model-role override must be a string when provided")
+        model_role = model_role_overrides or step.role
         if step.role == "coding":
             return asdict(self.coding_agent.execute_step(instruction, cwd, step.args))
         if step.role == "analysis":
-            return asdict(self.analysis_agent.execute_step(instruction, step.args))
+            return asdict(self.analysis_agent.execute_step(instruction, step.args, model_role=model_role))
         return self._execute_tool_step(step, cwd, tool_definition=tool_definition)
 
     def _prepare_executor_tool(self, step: PlanStep) -> ToolDefinition:
@@ -205,6 +247,8 @@ class StepRunner:
         if tool_definition is None:
             raise ToolRegistryError("executor step missing tool definition")
 
+        target_paths = resolve_tool_targets(tool_definition.name, step.args, cwd)
+        snapshots = snapshot_paths(target_paths) if is_filesystem_mutating_tool(tool_definition.name) else {}
         result = self.tool_registry.execute(
             tool_definition.name,
             step.args,
@@ -219,10 +263,23 @@ class StepRunner:
         if not result.success:
             raise RuntimeError(result.error or f"tool execution failed: {tool_definition.name}")
 
+        if is_filesystem_mutating_tool(tool_definition.name):
+            if result.output is None or (isinstance(result.output, str) and not result.output.strip()):
+                raise RuntimeError(f"tool execution returned no valid output: {tool_definition.name}")
+            for resolved_path in resolve_tool_targets(tool_definition.name, step.args, cwd, output=result.output):
+                snapshots.setdefault(str(resolved_path), {"exists": False, "kind": "missing", "digest": None})
+            verification = verify_path_mutations(snapshots, cwd=cwd)
+            files_modified = list(verification["files_modified"])
+        else:
+            verification = {"verified": False, "files_modified": [], "details": []}
+            files_modified = []
+
         return {
             "success": True,
             "tool_name": tool_definition.name,
             "output": result.output,
+            "files_modified": files_modified,
+            "verification": verification,
             "validation": {
                 "cwd": cwd,
                 "args_validated": True,
@@ -249,12 +306,21 @@ class StepRunner:
             "role": step.role,
             "args": step.args,
         }
-        failure_analysis = asdict(
-            self.analysis_agent.execute_step(
-                f"Analyze failure for step: {step.description}",
-                failure_context,
+        try:
+            failure_analysis = asdict(
+                self.analysis_agent.execute_step(
+                    f"Analyze failure for step: {step.description}",
+                    failure_context,
+                )
             )
-        )
+        except Exception as exc:
+            failure_analysis = {
+                "success": False,
+                "analysis": "",
+                "error": str(exc),
+                "context": failure_context,
+                "validation": {},
+            }
         return StepRunResult(
             status="failed",
             step_index=state.step_index,
@@ -282,3 +348,30 @@ class StepRunner:
         if isinstance(value, dict):
             return value
         return {"value": value}
+
+    @staticmethod
+    def _extract_files_modified(step: PlanStep, payload: dict[str, Any]) -> list[str]:
+        if step.role == "coding":
+            changed_files = payload.get("changed_files", [])
+            if isinstance(changed_files, list):
+                return [str(item) for item in changed_files if isinstance(item, str) and item.strip()]
+            return []
+        files_modified = payload.get("files_modified", [])
+        if isinstance(files_modified, list):
+            return [str(item) for item in files_modified if isinstance(item, str) and item.strip()]
+        return []
+
+    @staticmethod
+    def _extract_verification(payload: dict[str, Any]) -> dict[str, Any]:
+        verification = payload.get("verification", {})
+        if isinstance(verification, dict):
+            return verification
+        return {}
+
+    @staticmethod
+    def _requires_verified_mutation(step: PlanStep, tool_definition: ToolDefinition | None) -> bool:
+        if step.role == "coding":
+            return True
+        if tool_definition is None:
+            return False
+        return is_filesystem_mutating_tool(tool_definition.name)
