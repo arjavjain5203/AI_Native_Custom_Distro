@@ -48,6 +48,9 @@ class ExecutionState:
     steps: list[PlanStep] = field(default_factory=list)
     step_index: int = 0
     step_results: list[dict[str, Any]] = field(default_factory=list)
+    files_modified: list[str] = field(default_factory=list)
+    steps_completed: list[dict[str, Any]] = field(default_factory=list)
+    errors: list[dict[str, Any]] = field(default_factory=list)
     routing: dict[str, Any] = field(default_factory=dict)
     planning_metadata: dict[str, Any] = field(default_factory=dict)
     context: dict[str, Any] = field(default_factory=dict)
@@ -116,5 +119,7 @@ class StepRunResult:
     step: PlanStep
     result: Any = None
     step_result_entry: dict[str, Any] = field(default_factory=dict)
+    files_modified: list[str] = field(default_factory=list)
+    verification: dict[str, Any] = field(default_factory=dict)
     approval_request: ApprovalRequest | None = None
     failure_analysis: dict[str, Any] | None = None
