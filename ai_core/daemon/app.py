@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal
@@ -18,6 +19,7 @@ from ai_core.core.types import ExecutionOutcome, PlanStep
 from ai_core.mcp import MCPClient
 from ai_core.memory import TaskHistoryStore, VectorStore, WorkingMemoryStore
 from ai_core.models import ModelManager, Orchestrator
+from ai_core.models.download_manager import ModelDownloadManager
 from ai_core.models.router import ModelRouter
 from ai_core.tools import ToolRegistry, build_tool_registry
 
@@ -108,6 +110,12 @@ class ModelRoleUpdateRequest(BaseModel):
     model_name: str = Field(..., min_length=1)
 
 
+class ModelDownloadRequest(BaseModel):
+    """Background model download request payload."""
+
+    role: str | None = None
+
+
 class RollbackRequest(BaseModel):
     """Rollback execution payload."""
 
@@ -131,15 +139,14 @@ def create_app(
     mcp_client: MCPClient | None = None,
     tool_registry: ToolRegistry | None = None,
     execution_engine: ExecutionEngine | None = None,
+    download_manager: ModelDownloadManager | None = None,
 ) -> FastAPI:
     """Create the daemon application."""
-    app = FastAPI(
-        title="AI-Native Developer Operating Environment",
-        version="0.1.0",
-    )
     model_manager = model_manager or getattr(planner, "model_manager", None) or ModelManager()
     vector_store = vector_store or VectorStore()
     session_manager = session_manager or SessionManager()
+    tool_registry = tool_registry or build_tool_registry(mcp_client=mcp_client)
+    download_manager = download_manager or ModelDownloadManager(model_manager=model_manager)
     router = router or ModelRouter(
         model_manager=model_manager,
         orchestrator=Orchestrator(model_manager=model_manager, session_manager=session_manager),
@@ -148,12 +155,15 @@ def create_app(
     executor = executor or ExecutorAgent()
     history_store = history_store or TaskHistoryStore()
     history_store.initialize()
-    coding_agent = coding_agent or CodingAgent(model_manager=model_manager, vector_store=vector_store)
+    coding_agent = coding_agent or CodingAgent(
+        model_manager=model_manager,
+        vector_store=vector_store,
+        tool_registry=tool_registry,
+    )
     analysis_agent = analysis_agent or AnalysisAgent(model_manager=model_manager)
     approval_store = approval_store or ApprovalStore()
     working_memory_store = working_memory_store or WorkingMemoryStore()
     rollback_manager = rollback_manager or RollbackManager(history_store)
-    tool_registry = tool_registry or build_tool_registry(mcp_client=mcp_client)
     execution_engine = execution_engine or ExecutionEngine(
         router=router,
         planner=planner,
@@ -167,7 +177,24 @@ def create_app(
         session_manager=session_manager,
         vector_store=vector_store,
         tool_registry=tool_registry,
+        model_manager=model_manager,
+        download_manager=download_manager,
     )
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        download_manager.start()
+        try:
+            yield
+        finally:
+            download_manager.stop()
+
+    app = FastAPI(
+        title="AI-Native Developer Operating Environment",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+    app.state.download_manager = download_manager
 
     def serialize_steps(steps: list[PlanStep]) -> list[PlanStepResponse]:
         return [
@@ -241,6 +268,18 @@ def create_app(
     @app.get("/models", response_model=dict[str, Any])
     async def get_models() -> dict[str, Any]:
         return model_manager.list_configured_models()
+
+    @app.post("/models/downloads", response_model=dict[str, Any])
+    async def trigger_model_downloads(payload: ModelDownloadRequest) -> dict[str, Any]:
+        role = (payload.role or "all").strip()
+        if role.lower() == "all":
+            return download_manager.retry_all()
+        try:
+            response = download_manager.retry_role(role)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        response["models"] = model_manager.list_configured_models()
+        return response
 
     @app.get("/rollback", response_model=list[dict[str, Any]])
     async def list_rollback_candidates(limit: int = Query(default=20, ge=1, le=100)) -> list[dict[str, Any]]:
