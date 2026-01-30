@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Iterator
 from urllib import error, request
 
 from ai_core.core.config import OLLAMA_BASE_URL, OLLAMA_PLANNING_MODEL
@@ -34,9 +34,40 @@ class OllamaClient:
         }
         response = self._post_json("/api/generate", payload, timeout_seconds=timeout_seconds)
         text = response.get("response")
-        if not isinstance(text, str):
-            raise OllamaError("ollama response did not include text output")
-        return text.strip()
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+        payload["stream"] = True
+        return self._post_json_stream("/api/generate", payload, timeout_seconds=timeout_seconds)
+
+    def list_installed_models(self, *, timeout_seconds: float | None = None) -> set[str]:
+        """Return the set of locally installed Ollama model tags."""
+        payload = self._get_json("/api/tags", timeout_seconds=timeout_seconds)
+        models = payload.get("models", [])
+        if not isinstance(models, list):
+            raise OllamaError(f"ollama returned invalid tags payload: {payload}")
+
+        installed: set[str] = set()
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            name = model.get("name")
+            if isinstance(name, str) and name.strip():
+                installed.add(name.strip())
+        return installed
+
+    def pull_model_progress(
+        self,
+        model: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield streamed progress updates for an Ollama pull request."""
+        payload = {
+            "name": model,
+            "stream": True,
+        }
+        yield from self._post_json_stream_entries("/api/pull", payload, timeout_seconds=timeout_seconds or 3600)
 
     def _post_json(
         self,
@@ -71,3 +102,88 @@ class OllamaClient:
             raise OllamaError(str(data["error"]))
 
         return data
+
+    def _get_json(
+        self,
+        path: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        http_request = request.Request(
+            f"{self.base_url}{path}",
+            headers={"Content-Type": "application/json"},
+            method="GET",
+        )
+
+        try:
+            with request.urlopen(http_request, timeout=timeout_seconds or 60) as response:
+                raw = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            raise OllamaError(f"ollama returned HTTP {exc.code}: {details}") from exc
+        except error.URLError as exc:
+            raise OllamaError(f"could not reach ollama at {self.base_url}: {exc.reason}") from exc
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise OllamaError(f"ollama returned invalid JSON: {raw}") from exc
+
+        if isinstance(data, dict) and data.get("error"):
+            raise OllamaError(str(data["error"]))
+
+        return data
+
+    def _post_json_stream(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        chunks: list[str] = []
+        for data in self._post_json_stream_entries(path, payload, timeout_seconds=timeout_seconds):
+            text = data.get("response")
+            if isinstance(text, str) and text:
+                chunks.append(text)
+
+        response_text = "".join(chunks).strip()
+        if not response_text:
+            raise OllamaError("ollama response did not include text output")
+        return response_text
+
+    def _post_json_stream_entries(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        body = json.dumps(payload).encode("utf-8")
+        http_request = request.Request(
+            f"{self.base_url}{path}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with request.urlopen(http_request, timeout=timeout_seconds or 60) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise OllamaError(f"ollama returned invalid streamed JSON: {line}") from exc
+                    if not isinstance(data, dict):
+                        raise OllamaError(f"ollama returned invalid streamed payload: {data!r}")
+                    if data.get("error"):
+                        raise OllamaError(str(data["error"]))
+                    yield data
+        except error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            raise OllamaError(f"ollama returned HTTP {exc.code}: {details}") from exc
+        except error.URLError as exc:
+            raise OllamaError(f"could not reach ollama at {self.base_url}: {exc.reason}") from exc
