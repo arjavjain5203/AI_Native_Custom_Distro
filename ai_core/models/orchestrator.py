@@ -60,14 +60,7 @@ class Orchestrator:
             return fallback
 
     def _get_orchestrator_model(self) -> str:
-        models = self.model_manager.get_models()
-        role_config = models.get("orchestrator", {})
-        if not isinstance(role_config, dict):
-            raise ValueError("orchestrator model config must be an object")
-        model_name = role_config.get("ollama")
-        if not isinstance(model_name, str) or not model_name.strip():
-            raise ValueError("orchestrator ollama model is not configured")
-        return model_name.strip()
+        return self.model_manager.get_model_for_role("orchestrator")
 
     def _build_prompt(self, user_input: str, context: dict[str, Any]) -> str:
         recent_messages = context.get("recent_messages", [])
@@ -467,7 +460,7 @@ User input:
     def _looks_like_coding(text: str) -> bool:
         return bool(
             re.search(
-                r"\b(add|modify|edit|refactor|fix|update|implement)\b.*\b(code|project|repo|authentication|auth|jwt|endpoint|api|file|login|bug)\b",
+                r"(?:\b(add|modify|edit|refactor|fix|update|implement|write)\b.*\b(code|project|repo|authentication|auth|jwt|endpoint|api|file|login|bug|app|application|fastapi)\b)|(?:\b(create|build)\b.*\b(app|application|fastapi|endpoint|api|code)\b)",
                 text,
             )
         )
@@ -494,7 +487,7 @@ User input:
     def _looks_like_system(text: str) -> bool:
         return bool(
             re.search(
-                r"\b(create folder|create file|project structure|structure|install|package|pacman|docker|git|clone|branch|push|service|systemctl)\b",
+                r"\b(create folder|create file|list files|show files|project structure|structure|install|package|pacman|docker|git|clone|branch|push|service|systemctl)\b",
                 text,
             )
         )
