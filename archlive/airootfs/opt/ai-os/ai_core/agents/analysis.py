@@ -14,11 +14,16 @@ class AnalysisAgent:
     def __init__(self, model_manager: ModelManager | None = None) -> None:
         self.model_manager = model_manager or ModelManager()
 
-    def execute_step(self, instruction: str, step_args: dict[str, Any]) -> AnalysisStepResult:
+    def execute_step(
+        self,
+        instruction: str,
+        step_args: dict[str, Any],
+        *,
+        model_role: str = "analysis",
+    ) -> AnalysisStepResult:
         self._validate_inputs(instruction, step_args)
         prompt = self._build_prompt(instruction, step_args)
-        model_name = self.model_manager.get_model_for_task("analysis")
-        response = self.model_manager.run_model(model_name, prompt, task_type="analysis")
+        response = self.model_manager.run_role_model(model_role, prompt)
         result = AnalysisStepResult(
             success=True,
             analysis=response.strip(),
