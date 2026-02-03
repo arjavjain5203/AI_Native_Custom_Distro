@@ -47,18 +47,18 @@ class PlannerAgent:
             "analysis_pipeline",
         }
 
-    def plan(self, command: str) -> list[PlanStep]:
+    def plan(self, command: str, *, model_role: str = "planning") -> list[PlanStep]:
         """Compatibility wrapper returning only the validated plan steps."""
-        return self.plan_task(command).steps
+        return self.plan_task(command, model_role=model_role).steps
 
-    def plan_task(self, command: str) -> PlanningResult:
+    def plan_task(self, command: str, *, model_role: str = "planning") -> PlanningResult:
         """Create a validated plan without executing any step."""
         cleaned = command.strip()
         if not cleaned:
             raise ValueError("command cannot be empty")
 
         try:
-            llm_plan = self._plan_with_model(cleaned)
+            llm_plan = self._plan_with_model(cleaned, model_role=model_role)
             if llm_plan:
                 return PlanningResult(
                     steps=llm_plan,
@@ -77,11 +77,10 @@ class PlannerAgent:
             validation=self._build_validation(fallback_steps),
         )
 
-    def _plan_with_model(self, command: str) -> list[PlanStep]:
+    def _plan_with_model(self, command: str, *, model_role: str = "planning") -> list[PlanStep]:
         prompt = self._build_prompt(command)
         if self.model_manager is not None:
-            model_name = self.model_manager.get_model_for_task("planning")
-            response = self.model_manager.run_model(model_name, prompt, task_type="planning")
+            response = self.model_manager.run_role_model(model_role, prompt)
         else:
             response = self.ollama_client.generate(prompt, model=self.planning_model)
         return self._parse_llm_plan(response)
@@ -180,6 +179,9 @@ User command: {command}
         if read_match:
             path = read_match.group(1).strip()
             return [self._executor_step(f"Read file {path}", "read_file", {"path": path})]
+
+        if re.match(r"^(?:list|show)\s+files(?:\s+in\s+(?:the\s+)?current\s+directory)?$", cleaned, re.IGNORECASE):
+            return [self._executor_step("List files in current directory", "list_files", {})]
 
         if lower in {"git init", "initialize git", "init git"}:
             return [self._executor_step("Initialize git repository", "git_init", {})]
@@ -281,7 +283,7 @@ User command: {command}
     def _looks_like_coding(command: str) -> bool:
         return bool(
             re.search(
-                r"\b(add|modify|edit|refactor|fix|update|implement|write)\b.*\b(code|function|class|endpoint|api|auth|feature|repository|repo|project)\b",
+                r"(?:\b(add|modify|edit|refactor|fix|update|implement|write)\b.*\b(code|function|class|endpoint|api|auth|feature|repository|repo|project|app|application|fastapi)\b)|(?:\b(create|build)\b.*\b(app|application|fastapi|endpoint|api|code)\b)",
                 command,
                 re.IGNORECASE,
             )
