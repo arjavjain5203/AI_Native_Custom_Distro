@@ -102,6 +102,13 @@ def set_model_role(role: str, runtime: str, model_name: str, base_url: str) -> d
     )
 
 
+def retry_model_downloads(role: str | None, base_url: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if role is not None:
+        payload["role"] = role
+    return _http_post_json(_build_url(base_url, "/models/downloads"), payload)
+
+
 def submit_approval(approval_id: str, token: str, decision: str, base_url: str) -> dict[str, Any]:
     return _http_post_json(
         _build_url(base_url, f"/approvals/{approval_id}"),
@@ -190,9 +197,13 @@ def _dispatch_command(tokens: list[str], base_url: str) -> Any:
     if tokens[0] == "models":
         if len(tokens) == 1 or tokens[1] == "list":
             return get_models(base_url)
+        if len(tokens) == 2 and tokens[1] == "retry":
+            return retry_model_downloads("all", base_url)
+        if len(tokens) == 3 and tokens[1] == "retry":
+            return retry_model_downloads(tokens[2], base_url)
         if len(tokens) == 5 and tokens[1] == "set-role":
             return set_model_role(tokens[2], tokens[3], tokens[4], base_url)
-        raise CliError("usage is 'ai-os models [list|set-role <role> <runtime> <model>]'.")
+        raise CliError("usage is 'ai-os models [list|retry [role|all]|set-role <role> <runtime> <model>]'.")
 
     if tokens[0] == "health":
         return get_health(base_url)
