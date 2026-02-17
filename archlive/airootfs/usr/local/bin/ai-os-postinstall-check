@@ -7,6 +7,16 @@ LOG_FILE="/var/log/ai-os-installer.log"
 MAX_ATTEMPTS="${AI_OS_POSTINSTALL_HEALTH_ATTEMPTS:-15}"
 SLEEP_SECONDS="${AI_OS_POSTINSTALL_HEALTH_SLEEP:-2}"
 SERIAL_DEVICE="${AI_OS_INSTALLER_SERIAL_DEVICE:-/dev/ttyS0}"
+MODELS_CONFIG="${AI_OS_SYSTEM_MODELS_CONFIG:-/etc/ai-os/models.json}"
+OLLAMA_STORAGE_DIR="${AI_OS_OLLAMA_STORAGE_DIR:-/var/lib/ollama}"
+AI_DAEMON_API_URL="${AI_OS_API_URL:-http://127.0.0.1:8000}"
+AI_TASK_TIMEOUT="${AI_OS_POSTINSTALL_AI_TASK_TIMEOUT:-120}"
+MODEL_STATE_ATTEMPTS="${AI_OS_POSTINSTALL_MODEL_ATTEMPTS:-240}"
+MODEL_STATE_SLEEP="${AI_OS_POSTINSTALL_MODEL_SLEEP:-2}"
+FEATURE_SWEEP_DIR=""
+
+BLOCK_MESSAGE="This task requires a more capable model. Please wait for the model to finish downloading."
+FAILED_INSTALL_MESSAGE="Required model failed to install. Please retry installation."
 
 mkdir -p "${STATE_DIR}" "$(dirname "${LOG_FILE}")"
 touch "${LOG_FILE}"
@@ -30,11 +40,504 @@ emit_stage() {
     emit_serial_line "${marker}"
 }
 
+fail_with_stage() {
+    local stage="$1"
+    shift
+    log "$*"
+    emit_stage "${stage}"
+    exit 1
+}
+
+compact_detail() {
+    printf '%s' "$1" | tr '\r\n' '  ' | cut -c1-200
+}
+
+run_cli_json_command() {
+    local label="$1"
+    local output_file="$2"
+    local cwd="$3"
+    shift 3
+    local stderr_file
+
+    stderr_file="$(mktemp)"
+    if ! (
+        cd "${cwd}"
+        "$@"
+    ) >"${output_file}" 2>"${stderr_file}"; then
+        log "${label} failed: $(compact_detail "$(cat "${stderr_file}")")"
+        emit_serial_line "AIOS_${label}_ERROR:$(compact_detail "$(cat "${stderr_file}")")"
+        rm -f "${stderr_file}"
+        return 1
+    fi
+
+    rm -f "${stderr_file}"
+    return 0
+}
+
+curl_json_get() {
+    local label="$1"
+    local url="$2"
+    local timeout_seconds="$3"
+    local output_file="$4"
+    local stderr_file http_code
+
+    stderr_file="$(mktemp)"
+    if ! http_code="$(
+        curl -sS --max-time "${timeout_seconds}" \
+            -o "${output_file}" \
+            -w '%{http_code}' \
+            "${url}" \
+            2>"${stderr_file}"
+    )"; then
+        log "${label} GET failed: $(compact_detail "$(cat "${stderr_file}")")"
+        emit_serial_line "AIOS_${label}_ERROR:curl:$(compact_detail "$(cat "${stderr_file}")")"
+        rm -f "${stderr_file}" "${output_file}"
+        return 1
+    fi
+
+    rm -f "${stderr_file}"
+    if [[ ! "${http_code}" =~ ^2 ]]; then
+        log "${label} GET returned HTTP ${http_code}: $(compact_detail "$(cat "${output_file}")")"
+        emit_serial_line "AIOS_${label}_ERROR:http:${http_code}:$(compact_detail "$(cat "${output_file}")")"
+        rm -f "${output_file}"
+        return 1
+    fi
+
+    return 0
+}
+
+read_model_summary() {
+    python3 - "${1}" <<'PY'
+import json
+import shlex
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+
+def role_payload(role: str) -> dict:
+    if role == "orchestrator":
+        value = payload.get("intent")
+        if not isinstance(value, dict):
+            value = payload.get("orchestrator")
+    else:
+        value = payload.get(role)
+    if not isinstance(value, dict):
+        raise SystemExit(1)
+    return value
+
+summary = {}
+for role in ("orchestrator", "planning", "coding", "analysis"):
+    item = role_payload(role)
+    summary[role] = {
+        "state": str(item.get("state", "")).strip(),
+        "installed": item.get("installed") is True,
+        "model_name": str(item.get("model_name", "")).strip(),
+    }
+
+pending = [role for role, item in summary.items() if not item["installed"]]
+summary["pending_roles"] = pending
+summary["all_installed"] = not pending
+
+def emit(name: str, value: str) -> None:
+    print(f"{name}={shlex.quote(value)}")
+
+emit("ORCHESTRATOR_STATE", summary["orchestrator"]["state"])
+emit("ORCHESTRATOR_INSTALLED", "true" if summary["orchestrator"]["installed"] else "false")
+emit("ORCHESTRATOR_MODEL", summary["orchestrator"]["model_name"])
+emit("PLANNING_STATE", summary["planning"]["state"])
+emit("PLANNING_INSTALLED", "true" if summary["planning"]["installed"] else "false")
+emit("PLANNING_MODEL", summary["planning"]["model_name"])
+emit("CODING_STATE", summary["coding"]["state"])
+emit("CODING_INSTALLED", "true" if summary["coding"]["installed"] else "false")
+emit("CODING_MODEL", summary["coding"]["model_name"])
+emit("ANALYSIS_STATE", summary["analysis"]["state"])
+emit("ANALYSIS_INSTALLED", "true" if summary["analysis"]["installed"] else "false")
+emit("ANALYSIS_MODEL", summary["analysis"]["model_name"])
+emit("PENDING_ROLES", ",".join(pending))
+emit("ALL_INSTALLED", "true" if summary["all_installed"] else "false")
+emit("SNAPSHOT_JSON", json.dumps(summary, separators=(",", ":")))
+PY
+}
+
+emit_model_snapshot() {
+    emit_serial_line "AIOS_MODELS_SNAPSHOT:${SNAPSHOT_JSON}"
+    emit_serial_line "AIOS_MODEL_STATE:orchestrator:${ORCHESTRATOR_STATE}:${ORCHESTRATOR_MODEL}"
+    emit_serial_line "AIOS_MODEL_STATE:planning:${PLANNING_STATE}:${PLANNING_MODEL}"
+    emit_serial_line "AIOS_MODEL_STATE:coding:${CODING_STATE}:${CODING_MODEL}"
+    emit_serial_line "AIOS_MODEL_STATE:analysis:${ANALYSIS_STATE}:${ANALYSIS_MODEL}"
+    emit_serial_line "AIOS_MODEL_PENDING_ROLES:${PENDING_ROLES}"
+}
+
+validate_ollama_storage() {
+    local source fstype
+
+    source="$(findmnt -n -o SOURCE --target "${OLLAMA_STORAGE_DIR}" 2>/dev/null || true)"
+    fstype="$(findmnt -n -o FSTYPE --target "${OLLAMA_STORAGE_DIR}" 2>/dev/null || true)"
+
+    if [[ -z "${source}" || "${source}" == "overlay" || "${fstype}" == "overlay" || "${fstype}" == "tmpfs" ]]; then
+        fail_with_stage \
+            "INSTALL_FAILED:RUNTIME_OLLAMA_STORAGE_NOT_PERSISTENT" \
+            "Ollama storage is not disk-backed. target=${OLLAMA_STORAGE_DIR} source=${source:-missing} fstype=${fstype:-missing}"
+    fi
+
+    log "Verified disk-backed Ollama storage at ${OLLAMA_STORAGE_DIR}: ${source} (${fstype})"
+    emit_stage "RUNTIME_OLLAMA_STORAGE_OK:${source}"
+}
+
+validate_cli_runtime_surface() {
+    local health_output runtime_output configured_runtime detail
+
+    health_output="$(mktemp)"
+    if ! run_cli_json_command "CLI_HEALTH" "${health_output}" "/root" /usr/local/bin/ai-os --health; then
+        rm -f "${health_output}"
+        fail_with_stage "INSTALL_FAILED:CLI_HEALTHCHECK_FAILED" "ai-os --health failed."
+    fi
+    if ! python3 - "${health_output}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+if payload.get("status") != "ok" or payload.get("service") != "ai-daemon":
+    raise SystemExit(1)
+PY
+    then
+        detail="$(compact_detail "$(cat "${health_output}")")"
+        rm -f "${health_output}"
+        emit_serial_line "AIOS_CLI_HEALTH_ERROR:parse:${detail}"
+        fail_with_stage "INSTALL_FAILED:CLI_HEALTHCHECK_FAILED" "ai-os --health returned unexpected payload: ${detail}"
+    fi
+    rm -f "${health_output}"
+    emit_stage "CLI_HEALTH_OK"
+
+    runtime_output="$(mktemp)"
+    if ! run_cli_json_command "CLI_RUNTIME" "${runtime_output}" "/root" /usr/local/bin/ai-os runtime; then
+        rm -f "${runtime_output}"
+        fail_with_stage "INSTALL_FAILED:CLI_RUNTIME_FAILED" "ai-os runtime failed."
+    fi
+    if ! configured_runtime="$(
+        python3 - "${runtime_output}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+runtime = str(payload.get("configured_runtime", "")).strip()
+selected = payload.get("selected_runtime_by_role", {})
+if not runtime or not isinstance(selected, dict) or not selected:
+    raise SystemExit(1)
+print(runtime)
+PY
+    )"; then
+        detail="$(compact_detail "$(cat "${runtime_output}")")"
+        rm -f "${runtime_output}"
+        emit_serial_line "AIOS_CLI_RUNTIME_ERROR:parse:${detail}"
+        fail_with_stage "INSTALL_FAILED:CLI_RUNTIME_FAILED" "ai-os runtime returned unexpected payload: ${detail}"
+    fi
+    rm -f "${runtime_output}"
+    emit_stage "CLI_RUNTIME_OK:${configured_runtime}"
+}
+
+validate_daemon_runtime_surface() {
+    local runtime_output configured_runtime detail
+
+    runtime_output="$(mktemp)"
+    if ! curl_json_get "DAEMON_RUNTIME" "${AI_DAEMON_API_URL}/runtime" "${AI_TASK_TIMEOUT}" "${runtime_output}"; then
+        emit_stage "INSTALL_FAILED:DAEMON_RUNTIME_FAILED"
+        exit 1
+    fi
+    if ! configured_runtime="$(
+        python3 - "${runtime_output}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+runtime = str(payload.get("configured_runtime", "")).strip()
+selected = payload.get("selected_runtime_by_role", {})
+if not runtime or not isinstance(selected, dict) or not selected:
+    raise SystemExit(1)
+print(runtime)
+PY
+    )"; then
+        detail="$(compact_detail "$(cat "${runtime_output}")")"
+        rm -f "${runtime_output}"
+        emit_serial_line "AIOS_DAEMON_RUNTIME_ERROR:parse:${detail}"
+        fail_with_stage "INSTALL_FAILED:DAEMON_RUNTIME_FAILED" "Daemon /runtime returned unexpected payload: ${detail}"
+    fi
+    rm -f "${runtime_output}"
+    emit_stage "DAEMON_RUNTIME_OK:${configured_runtime}"
+}
+
+wait_for_orchestrator_ready() {
+    local models_output detail summary_env
+
+    for _ in $(seq 1 "${MODEL_STATE_ATTEMPTS}"); do
+        models_output="$(mktemp)"
+        if curl_json_get "MODEL_STATE_WAIT" "${AI_DAEMON_API_URL}/models" "${AI_TASK_TIMEOUT}" "${models_output}"; then
+            summary_env="$(read_model_summary "${models_output}" || true)"
+            if [[ -n "${summary_env}" ]]; then
+                eval "${summary_env}"
+                emit_model_snapshot
+                if [[ "${ORCHESTRATOR_INSTALLED}" == "true" && "${ORCHESTRATOR_STATE}" == "INSTALLED" ]]; then
+                    rm -f "${models_output}"
+                    emit_stage "ORCHESTRATOR_READY"
+                    return 0
+                fi
+            fi
+        fi
+        rm -f "${models_output}"
+        sleep "${MODEL_STATE_SLEEP}"
+    done
+
+    detail="$(compact_detail "$(
+        curl -sS --max-time "${AI_TASK_TIMEOUT}" "${AI_DAEMON_API_URL}/models" 2>/dev/null || true
+    )")"
+    emit_serial_line "AIOS_MODEL_STATE_WAIT_ERROR:${detail}"
+    fail_with_stage "INSTALL_FAILED:ORCHESTRATOR_NOT_READY" "Orchestrator did not reach INSTALLED state before timeout."
+}
+
+prepare_feature_workspace() {
+    FEATURE_SWEEP_DIR="$(mktemp -d "${STATE_DIR}/feature-sweep.XXXXXX")"
+    printf 'seed\n' > "${FEATURE_SWEEP_DIR}/seed.txt"
+    log "Prepared feature sweep workspace at ${FEATURE_SWEEP_DIR}"
+}
+
+validate_simple_task() {
+    local output_file detail
+
+    output_file="$(mktemp)"
+    if ! run_cli_json_command "CLI_SIMPLE_TASK" "${output_file}" "${FEATURE_SWEEP_DIR}" /usr/local/bin/ai-os "create folder test_project"; then
+        rm -f "${output_file}"
+        fail_with_stage "INSTALL_FAILED:CLI_SIMPLE_TASK_FAILED" "Simple folder creation task failed."
+    fi
+    if ! python3 - "${output_file}" "${FEATURE_SWEEP_DIR}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+workspace = Path(sys.argv[2])
+status = str(payload.get("status", "")).strip()
+if payload.get("success") is not True or status != "completed":
+    raise SystemExit(1)
+if not (workspace / "test_project").is_dir():
+    raise SystemExit(1)
+PY
+    then
+        detail="$(compact_detail "$(cat "${output_file}")")"
+        rm -f "${output_file}"
+        emit_serial_line "AIOS_CLI_SIMPLE_TASK_ERROR:parse:${detail}"
+        fail_with_stage "INSTALL_FAILED:CLI_SIMPLE_TASK_FAILED" "Simple folder creation task returned unexpected payload: ${detail}"
+    fi
+    rm -f "${output_file}"
+    emit_stage "CLI_SIMPLE_TASK_OK"
+}
+
+validate_planning_task() {
+    local output_file detail task_message
+
+    output_file="$(mktemp)"
+    if ! run_cli_json_command "CLI_PLANNING_TASK" "${output_file}" "${FEATURE_SWEEP_DIR}" /usr/local/bin/ai-os "list files in current directory"; then
+        rm -f "${output_file}"
+        fail_with_stage "INSTALL_FAILED:CLI_PLANNING_TASK_FAILED" "Planning/list-files task failed."
+    fi
+    if ! task_message="$(
+        python3 - "${output_file}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+status = str(payload.get("status", "")).strip()
+message = str(payload.get("message", "")).strip()
+if payload.get("success") is not True or status != "completed":
+    raise SystemExit(1)
+result = payload.get("result", {})
+if not isinstance(result, dict):
+    raise SystemExit(1)
+step_results = result.get("step_results", [])
+if not isinstance(step_results, list) or not step_results:
+    raise SystemExit(1)
+for entry in step_results:
+    if not isinstance(entry, dict):
+        continue
+    step_result = entry.get("result", {})
+    if not isinstance(step_result, dict):
+        continue
+    output = step_result.get("output")
+    if isinstance(output, list) and output:
+        print(message)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    )"; then
+        detail="$(compact_detail "$(cat "${output_file}")")"
+        rm -f "${output_file}"
+        emit_serial_line "AIOS_CLI_PLANNING_TASK_ERROR:parse:${detail}"
+        fail_with_stage "INSTALL_FAILED:CLI_PLANNING_TASK_FAILED" "Planning/list-files task returned unexpected payload: ${detail}"
+    fi
+    rm -f "${output_file}"
+    emit_serial_line "AIOS_CLI_PLANNING_TASK_MESSAGE:$(compact_detail "${task_message}")"
+    if [[ "${task_message}" == "${BLOCK_MESSAGE}" ]]; then
+        fail_with_stage "INSTALL_FAILED:CLI_PLANNING_TASK_FAILED" "Planning task was blocked instead of executing."
+    fi
+    if [[ "${task_message}" == "Using a smaller model because the preferred model is still downloading." ]]; then
+        emit_stage "CLI_PLANNING_TASK_FALLBACK"
+    fi
+    emit_stage "CLI_PLANNING_TASK_OK"
+}
+
+validate_coding_task_behavior() {
+    local models_output output_file detail summary_env
+    local task_message task_status task_success
+    local -a task_response
+
+    models_output="$(mktemp)"
+    if ! run_cli_json_command "CLI_MODELS_BEFORE_CODING" "${models_output}" "/root" /usr/local/bin/ai-os models; then
+        rm -f "${models_output}"
+        fail_with_stage "INSTALL_FAILED:CLI_CODING_TASK_FAILED" "Could not read model state before coding task."
+    fi
+    summary_env="$(read_model_summary "${models_output}" || true)"
+    if [[ -z "${summary_env}" ]]; then
+        detail="$(compact_detail "$(cat "${models_output}")")"
+        rm -f "${models_output}"
+        emit_serial_line "AIOS_CLI_CODING_TASK_ERROR:models:${detail}"
+        fail_with_stage "INSTALL_FAILED:CLI_CODING_TASK_FAILED" "Could not parse model state before coding task."
+    fi
+    eval "${summary_env}"
+    rm -f "${models_output}"
+
+    output_file="$(mktemp)"
+    if ! run_cli_json_command "CLI_CODING_TASK" "${output_file}" "${FEATURE_SWEEP_DIR}" /usr/local/bin/ai-os "create a fastapi app"; then
+        rm -f "${output_file}"
+        fail_with_stage "INSTALL_FAILED:CLI_CODING_TASK_FAILED" "Coding task command failed to reach the daemon."
+    fi
+    if ! mapfile -t task_response < <(
+        python3 - "${output_file}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+status = str(payload.get("status", "")).strip()
+success = "true" if payload.get("success") is True else "false"
+message = str(payload.get("message", "")).strip()
+print(status)
+print(success)
+print(message)
+PY
+    ); then
+        detail="$(compact_detail "$(cat "${output_file}")")"
+        rm -f "${output_file}"
+        emit_serial_line "AIOS_CLI_CODING_TASK_ERROR:parse:${detail}"
+        fail_with_stage "INSTALL_FAILED:CLI_CODING_TASK_FAILED" "Coding task returned invalid JSON: ${detail}"
+    fi
+    task_status="${task_response[0]:-}"
+    task_success="${task_response[1]:-}"
+    task_message="${task_response[2]:-}"
+
+    emit_serial_line "AIOS_CLI_CODING_TASK_MESSAGE:$(compact_detail "${task_message}")"
+
+    case "${CODING_STATE}" in
+        INSTALLED)
+            if [[ "${task_success}" != "true" || "${task_status}" != "completed" ]]; then
+                detail="$(compact_detail "$(cat "${output_file}")")"
+                rm -f "${output_file}"
+                emit_serial_line "AIOS_CLI_CODING_TASK_ERROR:unexpected:${detail}"
+                fail_with_stage "INSTALL_FAILED:CLI_CODING_TASK_FAILED" "Coding model was ready but the coding task did not complete."
+            fi
+            rm -f "${output_file}"
+            emit_stage "CLI_CODING_TASK_OK"
+            ;;
+        FAILED)
+            if [[ "${task_success}" != "false" || "${task_message}" != "${FAILED_INSTALL_MESSAGE}" ]]; then
+                detail="$(compact_detail "$(cat "${output_file}")")"
+                rm -f "${output_file}"
+                emit_serial_line "AIOS_CLI_CODING_TASK_ERROR:unexpected:${detail}"
+                fail_with_stage "INSTALL_FAILED:CLI_CODING_TASK_FAILED" "Coding task did not report the failed-install state correctly."
+            fi
+            rm -f "${output_file}"
+            emit_stage "CLI_CODING_BLOCK_OK"
+            ;;
+        *)
+            if [[ "${task_success}" != "false" || "${task_message}" != "${BLOCK_MESSAGE}" ]]; then
+                detail="$(compact_detail "$(cat "${output_file}")")"
+                rm -f "${output_file}"
+                emit_serial_line "AIOS_CLI_CODING_TASK_ERROR:unexpected:${detail}"
+                fail_with_stage "INSTALL_FAILED:CLI_CODING_TASK_FAILED" "Coding task was not blocked while the coding model was unavailable."
+            fi
+            rm -f "${output_file}"
+            emit_stage "CLI_CODING_BLOCK_OK"
+            ;;
+    esac
+}
+
+validate_cli_models_surface() {
+    local models_output detail summary_env
+
+    models_output="$(mktemp)"
+    if ! run_cli_json_command "CLI_MODELS" "${models_output}" "/root" /usr/local/bin/ai-os models; then
+        rm -f "${models_output}"
+        fail_with_stage "INSTALL_FAILED:CLI_MODELS_FAILED" "ai-os models failed."
+    fi
+    summary_env="$(read_model_summary "${models_output}" || true)"
+    if [[ -z "${summary_env}" ]]; then
+        detail="$(compact_detail "$(cat "${models_output}")")"
+        rm -f "${models_output}"
+        emit_serial_line "AIOS_CLI_MODELS_ERROR:parse:${detail}"
+        fail_with_stage "INSTALL_FAILED:CLI_MODELS_FAILED" "ai-os models returned unexpected payload: ${detail}"
+    fi
+    eval "${summary_env}"
+    if [[ "${ORCHESTRATOR_INSTALLED}" != "true" ]]; then
+        detail="$(compact_detail "$(cat "${models_output}")")"
+        rm -f "${models_output}"
+        emit_serial_line "AIOS_CLI_MODELS_ERROR:orchestrator:${detail}"
+        fail_with_stage "INSTALL_FAILED:CLI_MODELS_FAILED" "Orchestrator was not installed in ai-os models output."
+    fi
+    rm -f "${models_output}"
+    emit_model_snapshot
+    emit_stage "CLI_MODELS_OK:${ORCHESTRATOR_MODEL}"
+}
+
+validate_daemon_models_surface() {
+    local models_output detail summary_env
+
+    models_output="$(mktemp)"
+    if ! curl_json_get "DAEMON_MODELS" "${AI_DAEMON_API_URL}/models" "${AI_TASK_TIMEOUT}" "${models_output}"; then
+        emit_stage "INSTALL_FAILED:DAEMON_MODELS_FAILED"
+        exit 1
+    fi
+    summary_env="$(read_model_summary "${models_output}" || true)"
+    if [[ -z "${summary_env}" ]]; then
+        detail="$(compact_detail "$(cat "${models_output}")")"
+        rm -f "${models_output}"
+        emit_serial_line "AIOS_DAEMON_MODELS_ERROR:parse:${detail}"
+        fail_with_stage "INSTALL_FAILED:DAEMON_MODELS_FAILED" "Daemon /models returned unexpected payload: ${detail}"
+    fi
+    eval "${summary_env}"
+    if [[ "${ORCHESTRATOR_INSTALLED}" != "true" ]]; then
+        detail="$(compact_detail "$(cat "${models_output}")")"
+        rm -f "${models_output}"
+        emit_serial_line "AIOS_DAEMON_MODELS_ERROR:orchestrator:${detail}"
+        fail_with_stage "INSTALL_FAILED:DAEMON_MODELS_FAILED" "Orchestrator was not installed in daemon /models output."
+    fi
+    rm -f "${models_output}"
+    emit_model_snapshot
+    emit_stage "DAEMON_MODELS_OK:${ORCHESTRATOR_MODEL}"
+}
+
 log "Starting post-install AI daemon health check."
 emit_stage "HEALTHCHECK_START"
 
 for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
-    if /usr/local/bin/ai-os --health; then
+    if /usr/local/bin/ai-os --health >/dev/null 2>&1; then
+        validate_ollama_storage
+        validate_cli_runtime_surface
+        validate_daemon_runtime_surface
+        wait_for_orchestrator_ready
+        prepare_feature_workspace
+        validate_simple_task
+        validate_planning_task
+        validate_coding_task_behavior
+        validate_cli_models_surface
+        validate_daemon_models_surface
+        emit_stage "READY_WITH_BACKGROUND_DOWNLOADS"
         touch "${STAMP_FILE}"
         log "Post-install health check passed."
         emit_stage "HEALTHCHECK_OK"
