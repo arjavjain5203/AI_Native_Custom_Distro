@@ -23,6 +23,7 @@ file_permissions=(
   ["/usr/local/bin/Installation_guide"]="0:0:755"
   ["/usr/local/bin/ai-daemon"]="0:0:755"
   ["/usr/local/bin/ai-os-installer"]="0:0:755"
+  ["/usr/local/bin/ai-os-prepare-ollama-storage"]="0:0:755"
   ["/usr/local/bin/ai-os-postinstall-check"]="0:0:755"
   ["/usr/local/bin/ai-os"]="0:0:755"
   ["/usr/local/bin/livecd-sound"]="0:0:755"
