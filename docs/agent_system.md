@@ -2,89 +2,119 @@
 
 ## Purpose
 
-This document describes the multi-agent structure used in v1, the responsibilities of each agent, and how coordination works without turning the system into an unpredictable autonomous loop.
+This document describes the multi-agent structure, the responsibilities of each agent, and how coordination works without turning the system into an unpredictable autonomous loop.
 
 ## Agent Design Principles
 
-The platform uses multiple specialized agents because a single model trying to both reason and execute tends to be fragile. However, v1 intentionally limits the system to four agents with clear boundaries.
-
-The design principles are:
+The platform uses multiple specialized agents because a single model trying to both reason and execute tends to be fragile. The design principles are:
 
 - one agent, one main responsibility
 - no agent executes tools directly except through the tool engine
 - execution remains bounded by task state and step count
 - plans are reviewed before sensitive work begins
+- rule-based fallbacks ensure the system works without a running model
 
-## Planner Agent
+## Planner Agent (`ai_core/agents/planner.py`)
 
-The Planner Agent converts a natural language goal into a structured sequence of steps. It is responsible for:
+The Planner Agent converts a natural-language goal into a structured sequence of `PlanStep` objects. It is responsible for:
 
 - understanding user intent
-- deciding whether the task is supported in v1
+- deciding whether the task is supported
 - selecting a high-level workflow
 - producing an ordered execution plan
 
-Planner output should be structured rather than freeform narrative. Each step should include:
+### Planning Pipeline
 
-- step description
-- expected tool category
-- risk level
-- whether code retrieval is required
+1. The planner builds a structured prompt from the user command
+2. It calls the planning model via the Model Manager
+3. The response is parsed as a JSON array of plan steps
+4. Each step is validated against the allowed tool set
 
-The planner does not execute commands.
+### Fallback Planning
 
-## Executor Agent
+If the model is unavailable or returns invalid output, the planner falls back to rule-based pattern matching for common commands:
+
+- `create folder <path>` → `create_folder` tool
+- `create file <path>` → `create_file` tool
+- `read file <path>` → `read_file` tool
+- `git init` → `git_init` tool
+- `git commit <message>` → `git_commit` tool
+- `clone repo <url>` → `clone_repo` tool
+- `push changes` → `push_changes` tool (requires approval)
+- `install package <name>` → `pacman_install` tool (requires approval)
+- Coding-related requests → `coding_pipeline` tool
+- Analysis-related requests → `analysis_pipeline` tool
+
+### Plan Step Structure
+
+Each step includes:
+
+- `description` — human-readable step summary
+- `role` — executor, coding, or analysis
+- `tool_name` — the tool to invoke
+- `args` — tool arguments
+- `needs_retrieval` — whether code context is required
+- `requires_approval` — whether user confirmation is needed
+- `approval_category` — risk category (git_push, package_install, etc.)
+
+## Executor Agent (`ai_core/agents/executor.py`)
 
 The Executor Agent walks the approved plan. Its responsibilities are:
 
 - select the correct tool for each step
 - validate preconditions
-- execute one step at a time
+- execute one step at a time through the tool registry
 - record results and failure details
 - stop when a risky step requires additional approval
 
 The executor does not perform deep reasoning. It translates an approved plan into concrete tool operations.
 
-## Coding Agent
+## Coding Agent (`ai_core/agents/coding.py`)
 
-The Coding Agent is responsible for file generation and bounded code modifications. It is only activated when the task involves code understanding or source changes.
+The Coding Agent is responsible for file generation and bounded code modifications. It is activated when the task involves code understanding or source changes.
 
 Responsibilities:
 
-- retrieve relevant code chunks through the retrieval layer
-- reason about small and medium Python/FastAPI repositories
+- retrieve relevant code chunks through the VectorStore
+- reason about repository structure and dependencies
 - generate new files when required
 - modify existing files with targeted changes
-- explain unsupported repository shapes when v1 limits are exceeded
+- validate proposed changes against the codebase
+- explain unsupported repository shapes when limits are exceeded
 
-The coding agent must not edit a repository blindly. Retrieval is required before modification.
+The Coding Agent uses the coding model (`qwen2.5-coder:1.5b` by default) and requires retrieval context before making modifications.
 
-## Analysis Agent
+## Analysis Agent (`ai_core/agents/analysis.py`)
 
-The Analysis Agent handles system and environment diagnostics. In v1 it is basic but useful. It can:
+The Analysis Agent handles system and environment diagnostics:
 
 - explain why a tool setup failed
 - inspect package installation state
-- analyze command output
-- provide simple system-level developer diagnostics
+- analyze command output and error messages
+- provide system-level developer diagnostics
+- run environment health checks
 
-Examples include:
+Examples:
 
 - confirming whether Python or Docker is installed
 - interpreting a failing command in a setup workflow
 - reporting missing dependencies
+- explaining error tracebacks
 
 ## Coordination Model
 
-The standard coordination loop is:
+The coordination is managed by the Execution Engine (`ai_core/core/execution_engine.py`) and Step Runner (`ai_core/core/step_runner.py`):
 
-1. receive the task
-2. classify the intent
-3. ask Planner Agent for a plan
-4. request approval when needed
-5. hand the plan to Executor Agent
-6. invoke Coding Agent or Analysis Agent only when the current step requires them
-7. record outcomes and finish the task
+1. Execution Engine receives the task
+2. Orchestrator classifies the intent and selects an agent
+3. Planner Agent generates a structured plan
+4. Execution Engine checks for steps requiring approval
+5. Step Runner executes the plan step by step
+6. Coding Agent is invoked when a step has `needs_retrieval=True`
+7. Analysis Agent is invoked when a step uses `analysis_pipeline`
+8. Tool Registry dispatches tool calls
+9. Rollback Manager snapshots files before modification
+10. Outcomes are recorded in TaskHistoryStore
 
 This keeps planning, execution, coding, and diagnostics separated while still allowing collaboration between agents.
 
@@ -92,14 +122,17 @@ This keeps planning, execution, coding, and diagnostics separated while still al
 
 For `add authentication to this fastapi project`:
 
-1. Planner Agent produces a bounded code-modification plan
-2. Executor Agent requests repository indexing if the project is not indexed
-3. Coding Agent retrieves relevant files, proposes changes, and writes modifications through filesystem tools
-4. Executor Agent records the outcome and returns a task summary
+1. Orchestrator classifies as `coding` task type
+2. Planner Agent produces a bounded code-modification plan
+3. Coding Agent retrieves relevant files from the vector store
+4. Coding Agent proposes changes grounded in actual codebase context
+5. Step Runner applies changes through filesystem tools
+6. Rollback Manager snapshots modified files
+7. Execution Engine records the outcome and returns a task summary
 
-## Constraints in v1
+## Constraints
 
-The agent system does not aim for broad autonomy in v1. The following are explicitly out of scope:
+The agent system does not aim for broad autonomy. The following are explicitly out of scope:
 
 - large swarms of specialized agents
 - self-directed long-running research tasks
