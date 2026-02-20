@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The local API is the stable communication boundary between clients and the AI daemon. In v1 it is implemented with FastAPI and exposed only on localhost.
+The local API is the stable communication boundary between clients and the AI daemon. It is implemented with FastAPI and exposed only on localhost (port 8000 by default).
 
 ## API Principles
 
@@ -13,106 +13,188 @@ The API should be:
 - stable enough for future clients
 - simple enough to debug with standard HTTP tooling
 
-The terminal client is the primary consumer in v1, but the same API can later support a dashboard or editor integration.
+The terminal client is the primary consumer, but the same API supports future dashboards or editor integrations.
 
 ## Core Endpoints
 
-### `POST /tasks`
+### `GET /health`
 
-Creates a new task.
+Reports daemon health, service name, and version.
 
-Example request:
+Response:
+
+```json
+{
+  "status": "ok",
+  "service": "ai-daemon",
+  "version": "0.1.0"
+}
+```
+
+### `POST /task`
+
+Creates and executes a new task from a natural-language command.
+
+Request:
 
 ```json
 {
   "command": "create a fastapi project and push it to github",
-  "cwd": "/home/user/projects",
-  "context": {
-    "project_name": "demo-service"
-  }
+  "cwd": "/home/user/projects"
 }
 ```
 
-Example response:
+Response:
 
 ```json
 {
   "task_id": "task_001",
-  "status": "planning"
+  "status": "completed",
+  "success": true,
+  "message": "Task completed successfully",
+  "command": "create a fastapi project and push it to github",
+  "cwd": "/home/user/projects",
+  "steps": [
+    {
+      "description": "Create project directory",
+      "role": "executor",
+      "tool_name": "create_folder",
+      "args": {"path": "demo-service"},
+      "needs_retrieval": false,
+      "requires_approval": false,
+      "approval_category": null
+    }
+  ],
+  "result": {},
+  "approval_request": null
 }
 ```
+
+### `GET /tasks`
+
+Lists completed tasks with optional pagination.
+
+Query parameters:
+
+- `limit` (int, 1–100, default 20)
 
 ### `GET /tasks/{task_id}`
 
-Returns current task status, generated plan, step logs, and final result summary.
+Returns a single task by ID with full history, steps, and result.
 
-### `POST /projects/index`
+### `GET /runtime`
 
-Indexes a repository for retrieval-based code understanding.
+Returns the current model runtime configuration, hardware detection, and per-role model selection.
 
-Example request:
-
-```json
-{
-  "path": "/home/user/projects/demo-service"
-}
-```
-
-### `GET /health`
-
-Reports daemon health, database availability, Ollama availability, and high-level runtime readiness.
-
-### `GET /models/recommendations`
-
-Returns hardware-aware recommended models by role.
-
-Example response:
+Response:
 
 ```json
 {
-  "intent_model": "recommended-small-model",
-  "planning_model": "recommended-reasoning-model",
-  "coding_model": "recommended-coding-model"
+  "configured_runtime": "auto",
+  "detected_ram_gb": 16.0,
+  "cpu_cores": 8,
+  "low_memory_threshold_gb": 12.0,
+  "selected_runtime_by_role": {
+    "intent": "ollama",
+    "planning": "ollama",
+    "coding": "ollama"
+  },
+  "issues": {}
 }
 ```
 
-### `POST /models/install`
+### `POST /runtime`
 
-Installs or assigns models after user approval.
+Switches the model runtime (e.g., `ollama`, `airllm`, `auto`).
 
-### `GET /models/current`
+Request:
 
-Returns installed models, current role assignments, and whether each model is available.
+```json
+{
+  "runtime": "ollama"
+}
+```
 
-### `POST /permissions/decision`
+### `GET /models`
 
-Accepts user responses to approval prompts, including one-time or persistent decisions.
+Returns all configured models and their role assignments.
+
+### `POST /models/roles`
+
+Assigns a specific model to a role.
+
+Request:
+
+```json
+{
+  "role": "coding",
+  "runtime": "ollama",
+  "model_name": "qwen2.5-coder:1.5b"
+}
+```
+
+### `GET /approvals/{approval_id}`
+
+Returns a pending approval request by ID.
+
+### `POST /approvals/{approval_id}`
+
+Resolves an approval with a decision.
+
+Request:
+
+```json
+{
+  "token": "approval_token_abc",
+  "decision": "approve"
+}
+```
+
+### `GET /rollback`
+
+Lists tasks that have rollback candidates (file snapshots).
+
+Query parameters:
+
+- `limit` (int, 1–100, default 20)
+
+### `POST /rollback`
+
+Rolls back a specific task step, reverting file changes.
+
+Request:
+
+```json
+{
+  "task_id": "task_001",
+  "step_index": 2
+}
+```
 
 ## Internal Communication Model
 
-The API layer should remain thin. Endpoint handlers should:
+The API layer remains thin. Endpoint handlers:
 
-- validate input
-- create or look up task state
-- call the appropriate daemon subsystem
+- validate input via Pydantic models
+- delegate to the `ExecutionEngine` for task orchestration
 - return structured responses
 
-Endpoint handlers should not contain planning or execution logic directly.
+Endpoint handlers do not contain planning or execution logic directly.
 
 ## Task Status Shape
 
-Task responses should include:
+Task responses include:
 
 - task ID
-- current status
-- generated plan
-- current step
+- current status (`completed`, `failed`, `pending_approval`, `cancelled`)
+- success flag
+- generated plan steps
 - per-step results
 - final summary
-- error details when relevant
+- approval request details when relevant
 
 This allows the terminal client to show progress without re-implementing task logic.
 
 ## Security and Locality
 
-The API is local-only in v1. It should not be exposed to remote clients by default. Authentication can remain simple in v1 because the threat model assumes the local user owns the session, but the daemon must still validate requests and never treat client input as trusted shell commands.
+The API is local-only. It is not exposed to remote clients by default. The daemon validates all requests and never treats client input as trusted shell commands. The tool engine mediates all system mutations.
