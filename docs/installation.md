@@ -2,84 +2,167 @@
 
 ## Purpose
 
-This document explains how the operating environment is installed, what the ISO contains, and how model recommendation and setup work after installation.
+This document explains how to install and run the AI-Native Developer Operating Environment, both as a standalone development tool and as part of the custom Arch Linux distribution.
 
-## Distribution Base
+## Quick Start (Standalone)
 
-The platform is built on Arch Linux using `archiso`. The repository already includes an Arch image profile under `archlive/`, which serves as the current packaging base.
+The fastest way to get running:
 
-Version 1 extends that base with:
+```bash
+git clone https://github.com/arjavjain5203/AI_Native_Custom_Distro.git
+cd AI_Native_Custom_Distro
+chmod +x setup.sh
+./setup.sh
+```
 
-- the AI daemon
-- the AI developer terminal
-- the Ollama runtime
-- `i3` as the default desktop environment
-- required developer tooling and configuration
+The setup script:
 
-## ISO Contents
+1. Creates a Python virtual environment
+2. Installs all dependencies
+3. Creates `.env` from `.env.example`
+4. Checks Ollama installation
+5. Pulls required models (phi3:mini, gemma:2b, qwen2.5-coder:1.5b)
+6. Runs the test suite
 
-The v1 ISO should include:
+## Manual Setup
 
-- Arch base system
-- `i3` environment
+### Prerequisites
+
+- Python 3.12+
+- Git
+- Ollama ([install guide](https://ollama.com/download))
+- Linux (developed on Arch; works on any distro)
+
+### Steps
+
+```bash
+# Create a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
+
+# Configure environment
+cp .env.example .env
+# Edit .env with your settings (GITHUB_TOKEN, etc.)
+
+# Pull Ollama models
+ollama serve &
+ollama pull phi3:mini
+ollama pull gemma:2b
+ollama pull qwen2.5-coder:1.5b
+```
+
+### Start the Daemon
+
+```bash
+python main.py
+# or
+./ai-daemon
+```
+
+### Use the CLI
+
+```bash
+./ai-os --health
+./ai-os "create a new python project"
+./ai-os --history 10
+```
+
+## Docker Setup
+
+For container-based deployment:
+
+```bash
+docker build -t ai-native-dev-os .
+docker run -p 8000:8000 ai-native-dev-os
+```
+
+> **Note:** The container needs access to a running Ollama instance. Use `--network host` or set the `OLLAMA_HOST` environment variable.
+
+## Configuration
+
+### Environment Variables (`.env`)
+
+Copy `.env.example` to `.env` and configure:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GITHUB_TOKEN` | (empty) | GitHub personal access token |
+| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama API URL |
+| `AI_OS_API_HOST` | `127.0.0.1` | Daemon bind address |
+| `AI_OS_API_PORT` | `8000` | Daemon port |
+| `AI_OS_INTENT_MODEL` | `phi3:mini` | Intent classification model |
+| `AI_OS_PLANNING_MODEL` | `gemma:2b` | Planning model |
+| `AI_OS_CODING_MODEL` | `qwen2.5-coder:1.5b` | Code generation model |
+| `AI_OS_ANALYSIS_MODEL` | `gemma:2b` | Analysis model |
+| `AI_OS_MODEL_RUNTIME` | `auto` | Runtime selection (auto/ollama/airllm) |
+| `AI_OS_MEMORY_DB` | `ai_core.db` | SQLite database path |
+
+### System Configuration (`config.yaml`)
+
+The `config.yaml` file provides centralized configuration for models, agents, tools, and plugins. See the file for all available options.
+
+### Tool Permissions (`permissions.json`)
+
+The `permissions.json` file defines per-tool execution policies:
+
+- `allow` — execute without confirmation
+- `prompt` — require user approval
+- `deny` — block execution
+
+## Distribution Base (Arch ISO)
+
+The platform can be installed as a full operating environment through the custom Arch Linux ISO.
+
+### ISO Contents
+
+- Arch base system with `i3` desktop
 - Python runtime for the daemon
-- core developer tools
-- daemon service files
-- terminal client and configuration
+- Core developer tools
+- Daemon service files
+- Terminal client and configuration
+- Ollama runtime (models downloaded post-install)
 
-The ISO should not bundle all models. That keeps the image size under control and avoids installing large model files on machines that may not need them.
+### Building the ISO
 
-## Installation Flow
+```bash
+scripts/sync_runtime.sh
+scripts/pre_iso_check.sh
+sudo mkarchiso -v -w archiso-work -o out archlive
+```
 
-The target installation flow is:
+### Installation Flow
 
-1. boot the custom ISO
-2. install the Arch-based environment
-3. boot into the installed system
-4. enable and start the AI daemon through `systemd`
-5. run first-boot setup or installer guidance
-6. detect hardware and recommend models
-7. let the user accept defaults or choose custom models
-8. download selected models through Ollama after confirmation
+1. Boot the custom ISO
+2. Install the Arch-based environment
+3. Boot into the installed system
+4. Enable and start the AI daemon through `systemd`
+5. Run first-boot setup
+6. Detect hardware and receive model recommendations
+7. Accept defaults or choose custom models
+8. Download selected models through Ollama
 
 ## Hardware Detection and Model Recommendation
 
-Version 1 must inspect:
+The system inspects:
 
 - RAM
-- CPU
-- available disk space
+- CPU cores
+- Available disk space
 
-Based on that information, the system recommends one model for each role:
+Based on system resources, it recommends models for each role. The `LOW_MEMORY_THRESHOLD_GB` setting (default 12 GB) determines whether to suggest smaller models for constrained hardware.
 
-- intent classification
-- planning
-- coding
-
-The user can either:
+Users can:
 
 - install the recommended set
-- override the recommendations and choose custom models
+- override recommendations via config or API
+- change model assignments later through `POST /models/roles`
 
-This recommendation-driven setup is part of the product design. It gives a usable default without hiding control from advanced users.
+## Running Tests
 
-## Post-Install Model Management
-
-Model setup is not a one-time decision. The platform must support:
-
-- changing model assignments later
-- installing additional models after setup
-- runtime selection based on configured role assignments
-
-## Why This Design Was Chosen
-
-Bundling models into the ISO would make the distribution heavy and inflexible. Recommendation plus post-install download is better for:
-
-- varied hardware
-- smaller installation media
-- user control
-- easier upgrades over time
-
-## v1 Notes
-
-Voice setup and broader desktop choices are future concerns. Version 1 focuses on a single stable installation path with a single lightweight desktop and a post-install model recommendation flow.
+```bash
+.venv/bin/pytest -q
+```
