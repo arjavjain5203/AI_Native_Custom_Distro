@@ -2,72 +2,98 @@
 
 ## Purpose
 
-This document defines the memory design for v1. The memory layer stores structured runtime state, project context, and semantic search artifacts so the system can maintain continuity across tasks.
+This document defines the memory design for the platform. The memory layer stores structured runtime state, project context, and semantic search artifacts so the system can maintain continuity across tasks.
 
 ## Design Overview
 
-The memory layer combines two storage systems:
+The memory layer combines three storage components:
 
-- SQLite for structured, queryable data
-- FAISS for vector-based semantic retrieval
+- **TaskHistoryStore** (SQLite) — structured, queryable data
+- **VectorStore** (embeddings) — semantic retrieval for code understanding
+- **WorkingMemoryStore** — ephemeral context for active sessions
 
 These stores serve different purposes and should not be merged conceptually.
 
-## SQLite Responsibilities
+## TaskHistoryStore (`ai_core/memory/store.py`)
 
-SQLite stores data that needs strong structure and predictable updates, including:
+The SQLite-backed store handles all structured, persistent data:
 
-- user profile
-- task history
+- task history (command, plan steps, results, timestamps)
+- user preferences
 - project metadata
-- indexed file metadata
 - permission decisions
 - model role assignments
 
-Useful examples:
+The store initializes its schema on first use and provides methods for:
 
-- preferred editor
-- GitHub username
-- last indexed repository path
-- task status and timestamps
-- whether the user always allows package installation prompts
+- creating and retrieving tasks
+- listing recent tasks with pagination
+- storing and querying preferences
 
-## FAISS Responsibilities
+## VectorStore (`ai_core/memory/vector_store.py`)
 
-FAISS stores vector embeddings for code retrieval. It is used when the system needs to:
+The vector store handles semantic retrieval for code understanding. It is used when the system needs to:
 
 - search semantically related code chunks
 - locate files relevant to a requested feature
 - retrieve implementation context before editing
 
-FAISS should store chunk-level embeddings, while SQLite stores the metadata that maps each vector back to file path, symbol context, and repository identity.
+The store manages embeddings through the `embeddings.py` module and maps vectors back to file paths and chunk identifiers.
+
+### Indexing Pipeline
+
+1. Scan the repository for supported file types
+2. Chunk files into retrieval units
+3. Generate embeddings
+4. Store embeddings in the vector store
+5. Store metadata in SQLite
+
+### Retrieval Workflow
+
+When the Coding Agent needs context:
+
+1. Check whether the repository is indexed
+2. Use the task description to query for relevant chunks
+3. Supply retrieved context to the coding model
+4. Map proposed changes back to real files
+
+## WorkingMemoryStore (`ai_core/memory/working_memory.py`)
+
+Working memory provides short-lived context for active task sessions:
+
+- stores intermediate results during multi-step plans
+- tracks per-session state (files viewed, decisions made)
+- cleared after task completion
+
+This prevents ephemeral task context from polluting the persistent stores.
 
 ## Memory Domains
 
 ### User Memory
 
-User memory stores non-secret persistent preferences and environment context. Examples:
+User memory stores non-secret persistent preferences and environment context:
 
-- preferred language
-- editor preference
+- preferred language and editor
 - GitHub username
 - active project roots
+- model role overrides
 
 ### Task History
 
 Task history records:
 
 - raw user requests
-- generated plans
-- approval events
-- tool outcomes
-- errors
+- generated plans with step details
+- approval events and decisions
+- tool outcomes and artifacts
+- errors and failure context
+- timestamps
 
 This helps with debugging, future task context, and operator visibility.
 
 ### Project Memory
 
-Project memory stores repository-specific state such as:
+Project memory stores repository-specific state:
 
 - project path
 - framework type
@@ -77,13 +103,13 @@ Project memory stores repository-specific state such as:
 
 ## What Must Not Be Stored
 
-The memory system must not store secrets as plain data. In v1, this includes:
+The memory system must not store secrets as plain data:
 
 - GitHub personal access tokens
 - passwords
 - private keys
 
-Sensitive credentials should be stored through an OS-backed secure mechanism rather than SQLite.
+Sensitive credentials should be stored in environment variables (`.env`) or through an OS-backed secure mechanism, not in SQLite.
 
 ## Update Lifecycle
 
@@ -95,8 +121,17 @@ The memory layer is updated at specific points:
 - when approval settings change
 - when retrieval metadata is refreshed
 
-These updates should be explicit and deterministic. The platform should not depend on a model to decide how persistence works.
+These updates are explicit and deterministic. The platform does not depend on a model to decide how persistence works.
 
-## v1 Constraints
+## Configuration
 
-Version 1 uses memory for developer continuity, not for broad autonomous recall. The memory design is intentionally simple enough to remain debuggable while still supporting code retrieval and task tracking.
+Memory settings are managed through `config.yaml`:
+
+```yaml
+memory:
+  backend: "sqlite"
+  database: "ai_core.db"
+  vector_store: "faiss"
+```
+
+The database path can also be set via the `AI_OS_MEMORY_DB` environment variable.
