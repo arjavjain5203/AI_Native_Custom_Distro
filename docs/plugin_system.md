@@ -2,60 +2,120 @@
 
 ## Purpose
 
-The plugin system allows the platform to extend its tool capabilities without forcing all integrations into the daemon core. This is important for long-term open-source growth and for keeping v1 maintainable.
+The plugin system allows the platform to extend its tool capabilities without forcing all integrations into the daemon core. This is important for long-term open-source growth and for keeping the system maintainable.
 
 ## Plugin Architecture
 
-Plugins in v1 are Python modules that register tools with the tool registry. A plugin should define:
+Plugins are Python modules under the `plugins/` directory. Each plugin provides a dataclass-based interface that wraps lower-level tool implementations from `ai_core/tools/`. A plugin defines:
 
-- plugin name
-- version
-- declared permissions
-- exported tools
-- any required configuration
+- a plugin class with configuration
+- exported methods that map to tool operations
+- authentication handling where needed
+- structured return types
 
-This keeps integrations discoverable and testable.
+## Implemented Plugins
+
+### GitHub Plugin (`plugins/github_plugin.py`)
+
+The GitHub plugin wraps the core GitHub tools for repository management.
+
+```python
+from plugins.github_plugin import GitHubPlugin
+
+plugin = GitHubPlugin(token="ghp_...")
+plugin.authenticated       # True if token is configured
+plugin.create_repo("my-project", private=False)
+plugin.push_file("owner", "repo", "path/file.py", content, "commit msg")
+```
+
+Features:
+
+- `authenticated` — checks whether a token is configured
+- `create_repo(name, private)` — creates a GitHub repository
+- `push_file(owner, repo, path, content, message)` — pushes a file to a repository
+
+Authentication uses a personal access token from the `GITHUB_TOKEN` environment variable or explicit configuration.
+
+### Docker Plugin (`plugins/docker_plugin.py`)
+
+The Docker plugin provides container lifecycle management through the Docker CLI.
+
+```python
+from plugins.docker_plugin import DockerPlugin
+
+plugin = DockerPlugin()
+plugin.build(".", tag="app:latest")
+plugin.run("app:latest", name="my-app", ports={"8080": "80"})
+plugin.ps(all_containers=True)
+plugin.stop("my-app")
+```
+
+Features:
+
+- `build(path, tag)` — build a Docker image
+- `run(image, name, detach, ports)` — run a container
+- `stop(container)` — stop a running container
+- `ps(all_containers)` — list containers
+
+All operations run through subprocess, never through direct Docker socket access, to maintain the tool-engine security boundary.
 
 ## Registration Model
 
-At startup, the daemon should load enabled plugins and register their tools into the global tool registry. Registration should fail loudly if:
+Plugins register their tools by importing and wrapping the underlying `ai_core/tools/` implementations. At startup, enabled plugins can be loaded and their tools added to the global tool registry.
+
+Plugin loading fails loudly if:
 
 - required metadata is missing
 - a tool name collides with an existing tool
 - the plugin depends on unavailable runtime features
 
-Plugin loading should be deterministic rather than driven by model prompts.
+Plugin configuration is managed through `config.yaml` under the `plugins:` section:
 
-## v1 Plugins
+```yaml
+plugins:
+  github:
+    enabled: true
+  docker:
+    enabled: false
+    binary: "docker"
+```
 
-The required plugin domains in v1 are:
+## Permission Integration
 
-- filesystem
-- git
-- GitHub
-- package manager
+Plugin tools are subject to the same permission system as core tools. The `permissions.json` file defines per-tool policies:
 
-Docker should be designed as a plugin but treated as optional.
+- `allow` — execute without confirmation (e.g., listing repos)
+- `prompt` — require user approval (e.g., creating repos, running containers)
+- `deny` — block execution (e.g., system-level installs)
 
-## GitHub Plugin Example
+## Creating a New Plugin
 
-The GitHub plugin is the main external-service integration in v1. It should provide tools such as:
+To add a new plugin:
 
-- create repository
-- fetch repository metadata
-- verify authentication
+1. Create a new file in `plugins/` (e.g., `plugins/my_plugin.py`)
+2. Define a dataclass with configuration fields
+3. Implement methods that wrap tool operations
+4. Add permission entries in `permissions.json`
+5. Add configuration in `config.yaml` under `plugins:`
+6. Add tests in `tests/test_plugins.py`
 
-It should use a GitHub personal access token stored securely outside the normal memory database.
+Example skeleton:
 
-## Docker Plugin Example
+```python
+from dataclasses import dataclass
 
-Docker is not part of baseline v1 acceptance, but the architecture should make it easy to add a Docker plugin with tools such as:
+@dataclass
+class MyPlugin:
+    api_key: str = ""
 
-- install Docker
-- start or enable the Docker service
-- verify Docker availability
+    @property
+    def authenticated(self) -> bool:
+        return bool(self.api_key)
 
-Treat this as a stretch integration that benefits from the same plugin contract used by GitHub.
+    def my_operation(self, arg: str) -> dict:
+        # Implementation here
+        return {"success": True, "result": arg}
+```
 
 ## Why Plugins Matter
 
@@ -65,6 +125,12 @@ A plugin architecture provides three benefits:
 - it creates a stable extension point for future contributors
 - it supports incremental expansion without redesigning the whole system
 
-## v1 Boundaries
+## Future Plugin Directions
 
-Version 1 should not overcomplicate plugins with remote marketplaces or hot-reload systems. The goal is a clean local registration model that supports future growth.
+The long-term plugin ecosystem includes:
+
+- Database and migration tools
+- Cloud provider integrations (AWS, GCP, Azure)
+- CI/CD systems (GitHub Actions, GitLab CI)
+- Project templates and scaffolding packs
+- Package registry integrations (PyPI, npm)
