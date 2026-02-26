@@ -2,20 +2,27 @@
 
 ## Purpose
 
-This roadmap describes how to reach Version 1 from the current repository state. The project is currently planned as a solo build, so responsibilities are organized by workstream and phase rather than separate team members.
+This roadmap describes the project's development phases, their current status, and what remains for a complete Version 1 release.
 
-## Ownership Model
+## Phase Overview
 
-Version 1 assumes one primary developer owns:
+| Phase | Status | Description |
+|-------|--------|-------------|
+| 1. Arch Environment Baseline | ✅ Complete | ISO build, package layout, i3 desktop |
+| 2. AI Daemon and Local API | ✅ Complete | FastAPI daemon, task lifecycle, health API |
+| 3. Terminal Client | ✅ Complete | CLI command flow, plan approval, history |
+| 4. Tool Registry and Permissions | ✅ Complete | Permission-gated tool execution, registry |
+| 5. GitHub Workflow | ✅ Complete | Repo creation, PAT auth, push |
+| 6. Persistence and Memory | ✅ Complete | SQLite history, preferences, working memory |
+| 7. Code Indexing and Retrieval | ✅ Complete | Vector store, chunking, semantic retrieval |
+| 8. Coding Workflow | ✅ Complete | Retrieval-grounded code editing |
+| 9. Environment Setup and Diagnostics | 🟡 In Progress | Package management, Analysis Agent |
+| 10. ISO Integration and First-Boot | 🟡 In Progress | Daemon service, model recommendation |
+| 11. Stretch Work | 📋 Planned | Docker plugin, dashboard |
 
-- architecture and daemon implementation
-- Arch packaging and `archiso` integration
-- retrieval and code-understanding pipeline
-- documentation and validation
+---
 
-If the project later grows into a team, the workstreams can be split, but v1 planning should assume sequential execution by one owner.
-
-## Phase 1: Arch Environment Baseline
+## Phase 1: Arch Environment Baseline ✅
 
 ### Goal
 
@@ -23,16 +30,17 @@ Establish the Linux distribution baseline and package layout.
 
 ### Outputs
 
-- confirm and clean the `archlive/` build base
-- define required packages and service files
-- finalize `i3` as the default desktop
+- `archlive/` build base confirmed and cleaned
+- required packages and service files defined
+- `i3` finalized as the default desktop
 
-### Acceptance Criteria
+### Status
 
-- the ISO build base is reproducible
-- required runtime dependencies are identified
+Complete. The ISO builds reproducibly and ships with the correct runtime dependencies.
 
-## Phase 2: AI Daemon and Local API
+---
+
+## Phase 2: AI Daemon and Local API ✅
 
 ### Goal
 
@@ -40,16 +48,18 @@ Create the daemon skeleton and local FastAPI surface.
 
 ### Outputs
 
-- daemon process structure
-- local API endpoints
-- task lifecycle model
+- daemon process structure (`ai_core/daemon/`)
+- local API endpoints (`POST /task`, `GET /tasks`, `GET /health`, etc.)
+- task lifecycle model with full state machine
+- execution engine with step-by-step plan execution
 
-### Acceptance Criteria
+### Status
 
-- tasks can be created and queried through the API
-- health reporting works locally
+Complete. The daemon runs, creates tasks, routes to agents, and returns structured results. Includes runtime management, model configuration, approval flow, and rollback endpoints.
 
-## Phase 3: Terminal Client
+---
+
+## Phase 3: Terminal Client ✅
 
 ### Goal
 
@@ -57,15 +67,19 @@ Build the primary user interface.
 
 ### Outputs
 
-- terminal command entry flow
+- terminal command entry flow (`ai_core/cli/`)
 - task status display
 - plan presentation and approval collection
+- history viewing (`--history`)
+- health check (`--health`)
 
-### Acceptance Criteria
+### Status
 
-- a local user can submit a command and see task state changes
+Complete. Users can submit natural-language commands, view plans, approve execution, and review task history.
 
-## Phase 4: Tool Registry and Permissions
+---
+
+## Phase 4: Tool Registry and Permissions ✅
 
 ### Goal
 
@@ -73,17 +87,22 @@ Introduce the safe execution layer.
 
 ### Outputs
 
-- tool registry
-- filesystem tools
-- git tools
-- permission manager
+- tool registry (`ai_core/tools/registry.py`)
+- filesystem tools (`filesystem.py`)
+- git tools (`git_tools.py`)
+- shell tools (`shell.py`)
+- system tools (`system_tools.py`)
+- MCP tools (`mcp_tools.py`)
+- permission manager with category-based policies
+- `permissions.json` configuration
 
-### Acceptance Criteria
+### Status
 
-- approved tool calls execute through the registry
-- risky steps trigger confirmation
+Complete. All tool families are registered. Risky steps trigger confirmation. Rollback manager snapshots files before modification.
 
-## Phase 5: GitHub Workflow
+---
+
+## Phase 5: GitHub Workflow ✅
 
 ### Goal
 
@@ -91,15 +110,18 @@ Implement the first complete developer automation path.
 
 ### Outputs
 
-- GitHub plugin
+- GitHub tools (`github_tools.py`)
+- GitHub plugin (`plugins/github_plugin.py`)
 - PAT-based authentication flow
-- repository creation support
+- repository creation and file push support
 
-### Acceptance Criteria
+### Status
 
-- the system can create a project, initialize git, create a GitHub repository, and push code
+Complete. The system can create a project, initialize git, create a GitHub repository, and push code.
 
-## Phase 6: Persistence and Memory
+---
+
+## Phase 6: Persistence and Memory ✅
 
 ### Goal
 
@@ -107,18 +129,20 @@ Add structured state and task history.
 
 ### Outputs
 
-- SQLite persistence
+- SQLite persistence (`ai_core/memory/store.py`)
+- task history with full step detail
 - user preferences
-- task history
 - permission state
 - model assignments
+- working memory for active sessions (`working_memory.py`)
 
-### Acceptance Criteria
+### Status
 
-- task state survives process restarts where intended
-- approvals and settings can be reused
+Complete. Task state survives process restarts. Approvals, preferences, and model settings persist.
 
-## Phase 7: Code Indexing and Retrieval
+---
+
+## Phase 7: Code Indexing and Retrieval ✅
 
 ### Goal
 
@@ -126,16 +150,18 @@ Add semantic code retrieval for existing repositories.
 
 ### Outputs
 
-- repository scanner
-- chunking pipeline
-- FAISS index
+- vector store (`ai_core/memory/vector_store.py`)
+- embeddings pipeline (`embeddings.py`)
+- semantic search for code chunks
 - SQLite metadata mapping
 
-### Acceptance Criteria
+### Status
 
-- a small or medium FastAPI project can be indexed and queried for relevant context
+Complete. Repositories can be indexed and queried for relevant context during code modification tasks.
 
-## Phase 8: Coding Workflow
+---
+
+## Phase 8: Coding Workflow ✅
 
 ### Goal
 
@@ -143,15 +169,18 @@ Enable bounded code modifications on indexed repositories.
 
 ### Outputs
 
-- Coding Agent integration
+- Coding Agent integration (`ai_core/agents/coding.py`)
 - retrieval-grounded edits
 - validation flow for modified files
+- rollback support for file changes
 
-### Acceptance Criteria
+### Status
 
-- the system can modify an existing supported project in response to a bounded feature request
+Complete. The system can modify existing projects in response to bounded feature requests.
 
-## Phase 9: Environment Setup and Diagnostics
+---
+
+## Phase 9: Environment Setup and Diagnostics 🟡
 
 ### Goal
 
@@ -161,13 +190,18 @@ Support developer environment setup tasks and basic analysis.
 
 - `pacman` tool integration
 - installation verification
-- Analysis Agent basics
+- Analysis Agent basics (`ai_core/agents/analysis.py`)
+- system information tools
 
-### Acceptance Criteria
+### Remaining Work
 
-- the system can install a developer tool and verify the setup
+- deeper diagnostic workflows
+- broader package manager support
+- environment troubleshooting flows
 
-## Phase 10: ISO Integration and First-Boot Setup
+---
+
+## Phase 10: ISO Integration and First-Boot Setup 🟡
 
 ### Goal
 
@@ -180,11 +214,16 @@ Turn the runtime into an integrated developer operating environment.
 - first-boot hardware detection
 - model recommendation and install flow
 
-### Acceptance Criteria
+### Remaining Work
 
-- a fresh installed system can start the daemon and guide the user through model setup
+- systemd unit file finalization
+- first-boot wizard
+- model recommendation UI in terminal
+- ISO testing with full runtime
 
-## Phase 11: Stretch Work
+---
+
+## Phase 11: Stretch Work 📋
 
 ### Goal
 
@@ -192,12 +231,15 @@ Add optional features if the core system is stable.
 
 ### Outputs
 
-- Docker plugin
-- minimal settings or status dashboard
+- Docker plugin (implemented: `plugins/docker_plugin.py`)
+- Voice interface placeholder (implemented: `interfaces/voice.py`)
+- Minimal settings or status dashboard
 
-### Acceptance Criteria
+### Status
 
-- stretch features do not block v1 delivery if unfinished
+Docker plugin is implemented. Voice interface has a placeholder structure. Dashboard is planned.
+
+---
 
 ## Major Risks
 
