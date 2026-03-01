@@ -6,76 +6,105 @@ The tool system is the safe execution layer for the platform. Models and agents 
 
 ## Why a Tool Layer Is Required
 
-Without a tool layer, the system would have to trust model-generated shell commands directly. That would make the platform fragile and unsafe. The tool system introduces:
+Without a tool layer, the system would have to trust model-generated shell commands directly. The tool system introduces:
 
 - explicit operation boundaries
 - schema validation
 - permission checks
 - predictable return types
 - clearer logs and error handling
+- rollback support for file modifications
 
-## Tool Categories in v1
+## Tool Registry
 
-Version 1 includes four required tool families and one optional family:
+All tools are managed through the `ToolRegistry` (`ai_core/tools/registry.py`). The registry:
 
-- filesystem tools
-- git tools
-- GitHub tools
-- package manager tools (`pacman`)
-- Docker tools as a stretch feature
+- registers tools at daemon startup via `register_tools.py`
+- validates tool names and argument schemas before execution
+- enforces permission categories
+- dispatches tool calls to concrete implementations
+- returns structured results
 
-### Filesystem Tools
+## Implemented Tool Families
 
-Filesystem tools are used for:
+### Filesystem Tools (`filesystem.py`)
 
-- creating directories
-- reading files
-- writing files
-- updating files
-- listing project contents
+Filesystem tools handle:
 
-Filesystem tools must enforce path validation and stay aware of the task working directory.
+- `create_file` — create or overwrite a file with content
+- `create_folder` — create a directory tree
+- `read_file` — read file contents as UTF-8 text
+- `write_file` — write content to a file (creates parent directories)
+- `update_file` — overwrite an existing file (fails if missing)
+- `list_files` — recursively list all files under a directory
 
-### Git Tools
+Filesystem tools enforce path validation and return resolved absolute paths.
+
+### Git Tools (`git_tools.py`)
 
 Git tools handle:
 
-- `git init`
-- `git add`
-- `git commit`
-- `git branch`
-- `git push`
-- repository status checks
+- `git_init` — initialize a new repository
+- `git_add` — stage files for commit
+- `git_commit` — create a commit with a message
+- `git_push` / `push_changes` — push to remote
+- `create_branch` — create and checkout a new branch
+- `clone_repo` — clone a remote repository
+- `git_status` — check repository status
+- `git_diff` — show working tree differences
+- `git_log` — view commit history
 
-These tools should return structured results instead of raw terminal output whenever possible.
+These tools return structured results instead of raw terminal output.
 
-### GitHub Tools
+### GitHub Tools (`github_tools.py`)
 
-GitHub tools use the GitHub API for:
+GitHub tools use the GitHub REST API for:
 
-- creating repositories
-- retrieving repository metadata
-- optionally creating issues or branches in future versions
+- `create_repository` — create a new repository for the authenticated user
+- `create_branch_reference` — create a branch reference in a repository
+- `push_file_contents` — create or update a file through the GitHub contents API
 
-In v1, the primary goal is repository creation and authentication flow for project publishing.
+Authentication uses a personal access token from the `GITHUB_TOKEN` or `AI_OS_GITHUB_TOKEN` environment variable.
 
-### Package Manager Tools
+### Shell Tools (`shell.py`)
 
-Package manager tools wrap `pacman` for:
+Shell tools provide safe subprocess execution:
 
-- installing packages
-- verifying installed packages
-- checking package availability
+- `run_command` — execute a shell command with argument validation
+- structured capture of stdout, stderr, and return codes
+- timeout enforcement
 
-Because package installation affects the system, these tools are high-risk and require permission checks.
+Shell commands always flow through the tool engine rather than being generated directly by models.
 
-### Docker Tools
+### System Tools (`system_tools.py`)
 
-Docker tools are designed as a plugin-ready extension. They may be implemented if time permits, but v1 does not depend on them for baseline success.
+System tools provide:
+
+- `system_info` — read system information (RAM, CPU, OS)
+- `pacman_install` — install packages through pacman
+- `pacman_query` — check installed packages
+- `docker_check` — verify Docker availability
+
+Package installation is a high-risk operation and requires permission checks.
+
+### MCP Tools (`mcp_tools.py`)
+
+MCP (Model Context Protocol) tools provide integration with external MCP servers:
+
+- dynamic tool discovery from MCP servers
+- structured request/response handling
+- integration with the tool registry
+
+## Plugin Tools
+
+Plugins extend the tool system with additional integrations:
+
+- **GitHub Plugin** (`plugins/github_plugin.py`) — higher-level repository management
+- **Docker Plugin** (`plugins/docker_plugin.py`) — container lifecycle (build, run, stop, list)
 
 ## Tool Interface
 
-Each tool should expose:
+Each tool exposes:
 
 - a unique name
 - a permission category
@@ -83,35 +112,28 @@ Each tool should expose:
 - an execution function
 - a structured response format
 
-Example response fields:
-
-- `success`
-- `stdout`
-- `stderr`
-- `changed`
-- `artifacts`
-- `error_code`
-
 ## Execution Flow
 
 The standard tool execution path is:
 
-1. agent selects a tool based on the current plan step
-2. tool registry validates the tool name and arguments
-3. permission manager checks whether approval is required
-4. tool executes
-5. result is returned to the executor and recorded in task history
+1. Agent selects a tool based on the current plan step
+2. Tool registry validates the tool name and arguments
+3. Permission manager checks whether approval is required (per `permissions.json`)
+4. Rollback manager snapshots affected files
+5. Tool executes
+6. Result is returned to the step runner and recorded in task history
 
 ## Safety Rules
 
-The tool system must enforce the following rules:
+The tool system enforces:
 
-- no freeform shell generated by the model should run unchecked
+- no freeform shell generated by the model runs unchecked
 - destructive operations require elevated confirmation
-- shell commands should be invoked through safe argument lists when possible
+- shell commands use safe argument lists where possible
 - tool failures stop dependent steps
-- tools should return enough detail for debugging without exposing secrets
+- tools return enough detail for debugging without exposing secrets
+- file changes are snapshotted for rollback
 
 ## Design Outcome
 
-The tool system is what makes the platform feel like an operating environment instead of a prompt wrapper. It connects AI planning to real developer actions while preserving auditability and control.
+The tool system is what makes the platform feel like an operating environment instead of a prompt wrapper. It connects AI planning to real developer actions while preserving auditability, rollback, and control.
