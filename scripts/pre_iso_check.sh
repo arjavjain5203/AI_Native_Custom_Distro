@@ -93,6 +93,8 @@ check_shell_syntax() {
     log "Checking shell script syntax..."
     bash -n "${REPO_ROOT}/scripts/sync_runtime.sh"
     bash -n "${REPO_ROOT}/scripts/pre_iso_check.sh"
+    bash -n "${REPO_ROOT}/scripts/build_and_test_iso.sh"
+    bash -n "${REPO_ROOT}/scripts/run_vm_e2e_test.sh"
     bash -n "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-installer"
     bash -n "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check"
 }
@@ -103,6 +105,8 @@ check_installers() {
     require_executable "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check"
     require_executable "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os"
     require_executable "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-daemon"
+    require_executable "${REPO_ROOT}/scripts/build_and_test_iso.sh"
+    require_executable "${REPO_ROOT}/scripts/run_vm_e2e_test.sh"
 }
 
 check_model_config_path() {
@@ -127,10 +131,34 @@ check_serial_install_markers() {
     log "Checking installer serial markers..."
     grep -Fq 'emit_stage "INSTALLER_STARTED"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-installer" \
         || fail "Installer must emit an INSTALLER_STARTED marker."
-    grep -Fq 'emit_stage "MODEL_PULL_OK:${model_name}"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-installer" \
-        || fail "Installer must emit MODEL_PULL_OK markers."
+    grep -Fq 'emit_stage "MODEL_DOWNLOADS_BACKGROUND"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-installer" \
+        || fail "Installer must emit a MODEL_DOWNLOADS_BACKGROUND marker."
     grep -Fq 'emit_stage "MODELS_CONFIG_WRITTEN"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-installer" \
         || fail "Installer must emit a MODELS_CONFIG_WRITTEN marker."
+    grep -Fq 'emit_stage "ORCHESTRATOR_READY"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check" \
+        || fail "Post-install check must emit an ORCHESTRATOR_READY marker."
+    grep -Fq 'emit_stage "READY_WITH_BACKGROUND_DOWNLOADS"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check" \
+        || fail "Post-install check must emit a READY_WITH_BACKGROUND_DOWNLOADS marker."
+    grep -Fq 'emit_stage "RUNTIME_OLLAMA_STORAGE_OK:${source}"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check" \
+        || fail "Post-install check must emit a RUNTIME_OLLAMA_STORAGE_OK marker."
+    grep -Fq 'emit_stage "CLI_HEALTH_OK"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check" \
+        || fail "Post-install check must emit a CLI_HEALTH_OK marker."
+    grep -Fq 'emit_stage "CLI_RUNTIME_OK:${configured_runtime}"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check" \
+        || fail "Post-install check must emit a CLI_RUNTIME_OK marker."
+    grep -Fq 'emit_stage "CLI_SIMPLE_TASK_OK"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check" \
+        || fail "Post-install check must emit a CLI_SIMPLE_TASK_OK marker."
+    grep -Fq 'emit_stage "CLI_PLANNING_TASK_OK"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check" \
+        || fail "Post-install check must emit a CLI_PLANNING_TASK_OK marker."
+    grep -Fq 'emit_stage "CLI_CODING_BLOCK_OK"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check" \
+        || fail "Post-install check must emit a CLI_CODING_BLOCK_OK marker."
+    grep -Fq 'emit_stage "CLI_CODING_TASK_OK"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check" \
+        || fail "Post-install check must emit a CLI_CODING_TASK_OK marker."
+    grep -Fq 'emit_stage "CLI_MODELS_OK:${ORCHESTRATOR_MODEL}"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check" \
+        || fail "Post-install check must emit a CLI_MODELS_OK marker."
+    grep -Fq 'emit_stage "DAEMON_RUNTIME_OK:${configured_runtime}"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check" \
+        || fail "Post-install check must emit a DAEMON_RUNTIME_OK marker."
+    grep -Fq 'emit_stage "DAEMON_MODELS_OK:${ORCHESTRATOR_MODEL}"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check" \
+        || fail "Post-install check must emit a DAEMON_MODELS_OK marker."
     grep -Fq 'emit_stage "HEALTHCHECK_OK"' "${REPO_ROOT}/archlive/airootfs/usr/local/bin/ai-os-postinstall-check" \
         || fail "Post-install health check must emit a HEALTHCHECK_OK marker."
 }
