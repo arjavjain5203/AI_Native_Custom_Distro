@@ -16,6 +16,7 @@ WORK_DIR_DEFAULT="${WORK_DIR_ROOT}/${VM_NAME}-$(date +%Y%m%d-%H%M%S)"
 WORK_DIR="${AI_OS_VM_TEST_WORK_DIR:-${WORK_DIR_DEFAULT}}"
 SERIAL_LOG="${VM_SERIAL_LOG:-${ARTIFACT_DIR}/serial.log}"
 VM_INFO_LOG="${VM_INFO_LOG:-${ARTIFACT_DIR}/showvminfo.txt}"
+FEATURE_REPORT="${VM_FEATURE_REPORT:-${ARTIFACT_DIR}/feature-report.txt}"
 UART1_IOBASE="${VBOX_UART1_IOBASE:-0x3F8}"
 UART1_IRQ="${VBOX_UART1_IRQ:-4}"
 KEEP_VM_RUNNING_ON_FAILURE="${VM_KEEP_RUNNING_ON_FAILURE:-0}"
@@ -69,6 +70,7 @@ prepare_artifacts() {
     mkdir -p "${OUT_DIR}" "${WORK_DIR}" "${ARTIFACT_DIR}"
     : > "${SERIAL_LOG}"
     : > "${VM_INFO_LOG}"
+    : > "${FEATURE_REPORT}"
 }
 
 capture_vm_info() {
@@ -109,8 +111,22 @@ wait_for_install_result() {
         fi
 
         if serial_log_contains "AIOS_STAGE:INSTALL_COMPLETE" \
-            && serial_log_contains "AIOS_STAGE:HEALTHCHECK_OK" \
-            && (serial_log_contains "AIOS_STAGE:MODEL_PULL_OK:" || serial_log_contains "AIOS_STAGE:MODELS_ALREADY_PRESENT"); then
+            && serial_log_contains "AIOS_STAGE:MODEL_DOWNLOADS_BACKGROUND" \
+            && serial_log_contains "AIOS_STAGE:ORCHESTRATOR_READY" \
+            && serial_log_contains "AIOS_STAGE:READY_WITH_BACKGROUND_DOWNLOADS" \
+            && serial_log_contains "AIOS_STAGE:RUNTIME_OLLAMA_STORAGE_OK:" \
+            && serial_log_contains "AIOS_STAGE:CLI_HEALTH_OK" \
+            && serial_log_contains "AIOS_STAGE:CLI_RUNTIME_OK:" \
+            && serial_log_contains "AIOS_STAGE:CLI_MODELS_OK:" \
+            && serial_log_contains "AIOS_STAGE:CLI_SIMPLE_TASK_OK" \
+            && serial_log_contains "AIOS_STAGE:CLI_PLANNING_TASK_OK" \
+            && serial_log_contains "AIOS_STAGE:DAEMON_RUNTIME_OK:" \
+            && serial_log_contains "AIOS_STAGE:DAEMON_MODELS_OK:" \
+            && (
+                serial_log_contains "AIOS_STAGE:CLI_CODING_BLOCK_OK" \
+                || serial_log_contains "AIOS_STAGE:CLI_CODING_TASK_OK"
+            ) \
+            && serial_log_contains "AIOS_STAGE:HEALTHCHECK_OK"; then
             RESULT_STATUS="INSTALL_COMPLETE"
             return 0
         fi
@@ -120,6 +136,70 @@ wait_for_install_result() {
 
     RESULT_STATUS="TIMEOUT"
     return 1
+}
+
+generate_feature_report() {
+    python3 - "${SERIAL_LOG}" "${FEATURE_REPORT}" <<'PY'
+from pathlib import Path
+import sys
+
+serial_path = Path(sys.argv[1])
+report_path = Path(sys.argv[2])
+serial = serial_path.read_text(encoding="utf-8", errors="replace") if serial_path.exists() else ""
+
+features = [
+    ("ISO boot and automated installer", ["AIOS_STAGE:INSTALL_COMPLETE", "AIOS_STAGE:HEALTHCHECK_OK"]),
+    ("Background model downloads", ["AIOS_STAGE:MODEL_DOWNLOADS_BACKGROUND", "AIOS_STAGE:READY_WITH_BACKGROUND_DOWNLOADS"]),
+    ("Orchestrator early readiness", ["AIOS_STAGE:ORCHESTRATOR_READY"]),
+    ("Disk-backed Ollama storage", ["AIOS_STAGE:RUNTIME_OLLAMA_STORAGE_OK:"]),
+    ("AI terminal health command", ["AIOS_STAGE:CLI_HEALTH_OK"]),
+    ("AI terminal runtime command", ["AIOS_STAGE:CLI_RUNTIME_OK:"]),
+    ("AI terminal models command", ["AIOS_STAGE:CLI_MODELS_OK:"]),
+    ("Simple filesystem command", ["AIOS_STAGE:CLI_SIMPLE_TASK_OK"]),
+    ("Planning command during background downloads", ["AIOS_STAGE:CLI_PLANNING_TASK_OK"]),
+    ("Coding task gating behavior", ["AIOS_STAGE:CLI_CODING_BLOCK_OK"]),
+    ("Daemon runtime endpoint", ["AIOS_STAGE:DAEMON_RUNTIME_OK:"]),
+    ("Daemon models endpoint", ["AIOS_STAGE:DAEMON_MODELS_OK:"]),
+]
+
+not_verified = [
+    "Interactive/manual installer flow",
+    "Approval flow resolution",
+    "Balanced/performance model profiles",
+    "AirLLM runtime path",
+    "Real hardware boot/install",
+]
+
+working = []
+not_working = []
+for label, markers in features:
+    if label == "Coding task gating behavior":
+        if "AIOS_STAGE:CLI_CODING_BLOCK_OK" in serial or "AIOS_STAGE:CLI_CODING_TASK_OK" in serial:
+            working.append(label)
+        else:
+            not_working.append(label)
+        continue
+    if all(marker in serial for marker in markers):
+        working.append(label)
+    else:
+        not_working.append(label)
+
+lines = ["Working"]
+lines.extend(f"- {label}" for label in working)
+lines.append("")
+lines.append("Not Working")
+if not_working:
+    lines.extend(f"- {label}" for label in not_working)
+else:
+    lines.append("- None in the exercised VM path.")
+lines.append("")
+lines.append("Not Verified")
+lines.extend(f"- {label}" for label in not_verified)
+lines.append("")
+lines.append("Evidence")
+lines.append(f"- Serial log: {serial_path}")
+report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
 }
 
 main() {
@@ -167,10 +247,12 @@ main() {
     VM_STARTED=1
 
     if ! wait_for_install_result; then
+        generate_feature_report
         log "Installer verification failed with status: ${RESULT_STATUS}"
         log "Artifacts:"
         log "  serial log: ${SERIAL_LOG}"
         log "  vm info: ${VM_INFO_LOG}"
+        log "  feature report: ${FEATURE_REPORT}"
         if [[ -f "${SERIAL_LOG}" ]]; then
             log "Last serial log lines:"
             tail -n 80 "${SERIAL_LOG}" || true
@@ -182,11 +264,14 @@ main() {
     "${VBOXMANAGE}" controlvm "${VM_NAME}" poweroff
     VM_STARTED=0
 
+    generate_feature_report
+
     log "VM ISO install verification complete."
     log "Status: ${RESULT_STATUS}"
     log "Artifacts:"
     log "  serial log: ${SERIAL_LOG}"
     log "  vm info: ${VM_INFO_LOG}"
+    log "  feature report: ${FEATURE_REPORT}"
 }
 
 main "$@"
