@@ -22,6 +22,20 @@ class FailingOllamaClient:
     def generate(self, prompt: str, model: str | None = None) -> str:
         raise OllamaError("ollama unavailable")
 
+    def list_installed_models(self) -> set[str]:
+        return set()
+
+
+class InstalledModelsOllamaClient:
+    def __init__(self, installed_models: set[str] | None = None) -> None:
+        self.installed_models = installed_models or {"phi3:mini", "gemma:2b", "mistral:7b", "qwen2.5-coder:1.5b"}
+
+    def generate(self, prompt: str, model: str | None = None, timeout_seconds: float | None = None) -> str:
+        return "[]"
+
+    def list_installed_models(self) -> set[str]:
+        return set(self.installed_models)
+
 
 class RecordingRouter:
     def __init__(self, session_manager: SessionManager | None = None) -> None:
@@ -198,16 +212,43 @@ class StubExecutionEngine:
         )
 
 
+class StubDownloadManager:
+    def __init__(self) -> None:
+        self.retry_role_calls: list[str] = []
+        self.retry_all_calls = 0
+
+    def start(self) -> None:
+        return None
+
+    def retry_role(self, role: str) -> dict[str, object]:
+        self.retry_role_calls.append(role)
+        return {
+            "queued": True,
+            "role": role,
+            "model_name": "mistral:7b",
+            "message": "Model mistral:7b is downloading. You can run basic tasks.",
+        }
+
+    def retry_all(self) -> dict[str, object]:
+        self.retry_all_calls += 1
+        return {"queued_roles": ["intent", "planning"], "message": "Model downloads resumed."}
+
+
+def build_model_manager(tmp_path: Path, installed_models: set[str] | None = None) -> ModelManager:
+    return ModelManager(
+        ollama_client=InstalledModelsOllamaClient(installed_models=installed_models),
+        system_config_path=tmp_path / "system-models.json",
+        user_config_path=tmp_path / "user-models.json",
+        ram_gb_provider=lambda: 8.0,
+    )
+
+
 def test_api_health_and_task_flow(tmp_path: Path) -> None:
     db_path = tmp_path / "history.db"
     planner = PlannerAgent(ollama_client=FailingOllamaClient())
     history_store = TaskHistoryStore(db_path)
     working_memory_store = WorkingMemoryStore()
-    model_manager = ModelManager(
-        system_config_path=tmp_path / "system-models.json",
-        user_config_path=tmp_path / "user-models.json",
-        ram_gb_provider=lambda: 8.0,
-    )
+    model_manager = build_model_manager(tmp_path)
     app = create_app(
         planner=planner,
         history_store=history_store,
@@ -235,6 +276,7 @@ def test_api_health_and_task_flow(tmp_path: Path) -> None:
 
             models = await client.get("/models")
             assert models.status_code == 200
+            assert "intent" in models.json()
             assert "planning" in models.json()
 
             updated_model = await client.post(
@@ -242,7 +284,7 @@ def test_api_health_and_task_flow(tmp_path: Path) -> None:
                 json={"role": "planning", "runtime": "ollama", "model_name": "mistral:7b"},
             )
             assert updated_model.status_code == 200
-            assert updated_model.json()["planning"]["ollama"] == "mistral:7b"
+            assert updated_model.json()["planning"]["configured"]["ollama"] == "mistral:7b"
 
             workdir = tmp_path / "workspace"
             workdir.mkdir()
@@ -309,14 +351,36 @@ def test_api_health_and_task_flow(tmp_path: Path) -> None:
     asyncio.run(run_scenario())
 
 
+def test_api_exposes_model_download_retry_endpoint(tmp_path: Path) -> None:
+    download_manager = StubDownloadManager()
+    app = create_app(
+        planner=PlannerAgent(ollama_client=FailingOllamaClient()),
+        history_store=TaskHistoryStore(tmp_path / "history.db"),
+        model_manager=build_model_manager(tmp_path),
+        vector_store=VectorStore(db_path=tmp_path / "vectors.db"),
+        download_manager=download_manager,  # type: ignore[arg-type]
+    )
+
+    async def run_scenario() -> None:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            role_retry = await client.post("/models/downloads", json={"role": "planning"})
+            assert role_retry.status_code == 200
+            assert role_retry.json()["message"] == "Model mistral:7b is downloading. You can run basic tasks."
+            assert download_manager.retry_role_calls == ["planning"]
+
+            retry_all = await client.post("/models/downloads", json={})
+            assert retry_all.status_code == 200
+            assert retry_all.json()["message"] == "Model downloads resumed."
+            assert download_manager.retry_all_calls == 1
+
+    asyncio.run(run_scenario())
+
+
 def test_api_passes_session_context_to_router(tmp_path: Path) -> None:
     db_path = tmp_path / "history.db"
     planner = PlannerAgent(ollama_client=FailingOllamaClient())
-    model_manager = ModelManager(
-        system_config_path=tmp_path / "system-models.json",
-        user_config_path=tmp_path / "user-models.json",
-        ram_gb_provider=lambda: 8.0,
-    )
+    model_manager = build_model_manager(tmp_path)
     session_manager = SessionManager()
     router = RecordingRouter(session_manager=session_manager)
     app = create_app(
@@ -373,6 +437,7 @@ def test_api_returns_conversation_mode_without_execution(tmp_path: Path) -> None
     app = create_app(
         planner=PlannerAgent(ollama_client=FailingOllamaClient()),
         history_store=TaskHistoryStore(db_path),
+        model_manager=build_model_manager(tmp_path),
         router=ConversationRouter(),  # type: ignore[arg-type]
         vector_store=VectorStore(db_path=tmp_path / "vectors.db"),
     )
@@ -405,6 +470,7 @@ def test_api_retries_failed_step_and_then_succeeds(tmp_path: Path) -> None:
     app = create_app(
         planner=StubPlanningAgent([step]),  # type: ignore[arg-type]
         history_store=TaskHistoryStore(db_path),
+        model_manager=build_model_manager(tmp_path),
         router=RecordingRouter(),  # type: ignore[arg-type]
         tool_registry=tool_registry,
         vector_store=VectorStore(db_path=tmp_path / "vectors.db"),
@@ -439,6 +505,7 @@ def test_api_aborts_safely_after_retry_exhaustion(tmp_path: Path) -> None:
         planner=StubPlanningAgent([step]),  # type: ignore[arg-type]
         analysis_agent=analysis,  # type: ignore[arg-type]
         history_store=TaskHistoryStore(db_path),
+        model_manager=build_model_manager(tmp_path),
         router=RecordingRouter(),  # type: ignore[arg-type]
         tool_registry=tool_registry,
         vector_store=VectorStore(db_path=tmp_path / "vectors.db"),
