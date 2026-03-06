@@ -50,7 +50,12 @@ def test_cli_models_set_role(monkeypatch, capsys) -> None:
         cli_main,
         "set_model_role",
         lambda role, runtime, model_name, base_url: {
-            role: {runtime: model_name},
+            role: {
+                "configured": {runtime: model_name},
+                "runtime": runtime,
+                "model_name": model_name,
+                "installed": True,
+            },
             "runtime": "auto",
         },
     )
@@ -59,7 +64,24 @@ def test_cli_models_set_role(monkeypatch, capsys) -> None:
 
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["planning"]["ollama"] == "mistral:7b"
+    assert payload["planning"]["configured"]["ollama"] == "mistral:7b"
+
+
+def test_cli_models_retry(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "retry_model_downloads",
+        lambda role, base_url: {
+            "role": role or "all",
+            "message": "Model mistral:7b is downloading. You can run basic tasks.",
+        },
+    )
+
+    exit_code = cli_main.main(["models", "retry", "planning"])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["role"] == "planning"
 
 
 def test_cli_rollback_list(monkeypatch, capsys) -> None:
