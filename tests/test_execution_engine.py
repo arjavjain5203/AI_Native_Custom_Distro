@@ -10,6 +10,7 @@ from ai_core.core.types import AnalysisStepResult, ModelSelection, PlanStep, Pla
 from ai_core.memory.store import TaskHistoryStore
 from ai_core.memory.vector_store import VectorStore
 from ai_core.memory.working_memory import WorkingMemoryStore
+from ai_core.models.manager import ModelState
 
 
 class StubRouter:
@@ -81,6 +82,34 @@ class StubAnalysisAgent:
         )
 
 
+class LifecycleModelManager:
+    def __init__(self, states: dict[str, ModelState], names: dict[str, str] | None = None) -> None:
+        self.states = dict(states)
+        self.names = names or {
+            "orchestrator": "phi3:mini",
+            "planning": "mistral:7b",
+            "coding": "qwen2.5-coder:1.5b",
+            "analysis": "gemma:2b",
+        }
+
+    def get_model_state(self, role: str) -> ModelState:
+        normalized = "orchestrator" if role in {"intent", "orchestrator"} else role
+        return self.states[normalized]
+
+    def get_model_name_for_role(self, role: str) -> str:
+        normalized = "orchestrator" if role in {"intent", "orchestrator"} else role
+        return self.names[normalized]
+
+
+class RecordingDownloadManager:
+    def __init__(self) -> None:
+        self.queued_roles: list[str] = []
+
+    def ensure_role_queued(self, role: str) -> bool:
+        self.queued_roles.append(role)
+        return True
+
+
 def build_engine(
     tmp_path: Path,
     *,
@@ -129,6 +158,16 @@ def test_execution_engine_runs_executor_pipeline_and_records_history(tmp_path: P
     outcome = engine.run_task("create a folder demo", {"cwd": str(workspace)})
 
     assert outcome.result.success is True
+    assert outcome.result.data["files_modified"] == ["demo"]
+    assert outcome.result.data["steps_completed"] == [
+        {
+            "step_index": 0,
+            "step": "Create folder demo",
+            "role": "executor",
+            "tool_name": "create_folder",
+        }
+    ]
+    assert outcome.result.data["errors"] == []
     assert (workspace / "demo").is_dir()
     assert working_memory_store.get(outcome.task_id) is None
     stored_task = history_store.get_task(outcome.task_id)
@@ -209,6 +248,9 @@ def test_execution_engine_treats_structured_coding_failure_as_failed_step(tmp_pa
     assert outcome.result.success is False
     assert outcome.result.message == "Step failed after retries: Update application code"
     assert outcome.result.data["step_results"][0]["result"]["error"] == "Validation failed after retries"
+    assert outcome.result.data["files_modified"] == []
+    assert outcome.result.data["steps_completed"] == []
+    assert outcome.result.data["errors"][0]["message"] == "Validation failed after retries"
     stored_task = history_store.get_task(outcome.task_id)
     assert stored_task is not None
     assert stored_task["success"] is False
@@ -229,7 +271,8 @@ def test_execution_engine_links_continuation_to_previous_task(tmp_path: Path) ->
     assert second_task is not None
     assert first_task["parent_task_id"] is None
     assert second_task["parent_task_id"] == first.task_id
-    assert second_task["task_summary"] == "Completed: continue and add to this setup"
+    assert second_task["success"] is False
+    assert second_task["task_summary"] == "Failed: continue and add to this setup"
 
 
 def test_execution_engine_indexes_completed_task_for_recall(tmp_path: Path) -> None:
@@ -259,3 +302,116 @@ def test_execution_engine_indexes_completed_task_for_recall(tmp_path: Path) -> N
     assert first.result.success is True
     assert related
     assert related[0]["task_id"] == first.task_id
+
+
+def test_execution_engine_blocks_when_orchestrator_is_not_installed(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    router = StubRouter(mode="execution")
+    download_manager = RecordingDownloadManager()
+    history_store = TaskHistoryStore(tmp_path / "history.db")
+    history_store.initialize()
+    engine = ExecutionEngine(
+        router=router,  # type: ignore[arg-type]
+        planner=StubPlanningAgent([]),  # type: ignore[arg-type]
+        executor=ExecutorAgent(),
+        coding_agent=StubCodingAgent(),  # type: ignore[arg-type]
+        analysis_agent=StubAnalysisAgent(),  # type: ignore[arg-type]
+        approval_store=ApprovalStore(),
+        history_store=history_store,
+        working_memory_store=WorkingMemoryStore(),
+        rollback_manager=RollbackManager(history_store),
+        session_manager=SessionManager(),
+        vector_store=VectorStore(db_path=tmp_path / "vectors.db"),
+        model_manager=LifecycleModelManager({"orchestrator": ModelState.NOT_INSTALLED}),
+        download_manager=download_manager,  # type: ignore[arg-type]
+    )
+
+    outcome = engine.run_task("create a folder demo", {"cwd": str(workspace)})
+
+    assert outcome.result.success is False
+    assert outcome.result.message == (
+        "Orchestrator model is not installed yet. Please wait while it is downloading. "
+        "You can continue using normal terminal commands."
+    )
+    assert download_manager.queued_roles == ["orchestrator"]
+
+
+def test_execution_engine_uses_orchestrator_fallback_for_simple_planning_tasks(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    step = PlanStep(description="Create folder demo", role="executor", tool_name="create_folder", args={"path": "demo"})
+    history_store = TaskHistoryStore(tmp_path / "history.db")
+    history_store.initialize()
+    engine = ExecutionEngine(
+        router=StubRouter(mode="execution"),  # type: ignore[arg-type]
+        planner=StubPlanningAgent([step]),  # type: ignore[arg-type]
+        executor=ExecutorAgent(),
+        coding_agent=StubCodingAgent(),  # type: ignore[arg-type]
+        analysis_agent=StubAnalysisAgent(),  # type: ignore[arg-type]
+        approval_store=ApprovalStore(),
+        history_store=history_store,
+        working_memory_store=WorkingMemoryStore(),
+        rollback_manager=RollbackManager(history_store),
+        session_manager=SessionManager(),
+        vector_store=VectorStore(db_path=tmp_path / "vectors.db"),
+        model_manager=LifecycleModelManager(
+            {
+                "orchestrator": ModelState.INSTALLED,
+                "planning": ModelState.DOWNLOADING,
+                "coding": ModelState.INSTALLED,
+                "analysis": ModelState.INSTALLED,
+            }
+        ),
+        download_manager=RecordingDownloadManager(),  # type: ignore[arg-type]
+    )
+
+    outcome = engine.run_task("create a folder demo", {"cwd": str(workspace)})
+
+    assert outcome.result.success is True
+    assert outcome.result.message == "Using a smaller model because the preferred model is still downloading."
+    assert "Model mistral:7b is downloading. You can run basic tasks." in outcome.result.data["model_notices"]
+
+
+def test_execution_engine_blocks_coding_when_model_is_unavailable(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    step = PlanStep(
+        description="Apply coding workflow for auth",
+        role="coding",
+        tool_name="coding_pipeline",
+        args={"instruction": "add auth"},
+        needs_retrieval=True,
+    )
+    download_manager = RecordingDownloadManager()
+    history_store = TaskHistoryStore(tmp_path / "history.db")
+    history_store.initialize()
+    engine = ExecutionEngine(
+        router=StubRouter(mode="execution"),  # type: ignore[arg-type]
+        planner=StubPlanningAgent([step]),  # type: ignore[arg-type]
+        executor=ExecutorAgent(),
+        coding_agent=StubCodingAgent(),  # type: ignore[arg-type]
+        analysis_agent=StubAnalysisAgent(),  # type: ignore[arg-type]
+        approval_store=ApprovalStore(),
+        history_store=history_store,
+        working_memory_store=WorkingMemoryStore(),
+        rollback_manager=RollbackManager(history_store),
+        session_manager=SessionManager(),
+        vector_store=VectorStore(db_path=tmp_path / "vectors.db"),
+        model_manager=LifecycleModelManager(
+            {
+                "orchestrator": ModelState.INSTALLED,
+                "planning": ModelState.INSTALLED,
+                "coding": ModelState.NOT_INSTALLED,
+                "analysis": ModelState.INSTALLED,
+            }
+        ),
+        download_manager=download_manager,  # type: ignore[arg-type]
+    )
+
+    outcome = engine.run_task("add auth", {"cwd": str(workspace)})
+
+    assert outcome.result.success is False
+    assert outcome.result.message == "This task requires a more capable model. Please wait for the model to finish downloading."
+    assert "Model qwen2.5-coder:1.5b is downloading. You can run basic tasks." in outcome.result.data["model_notices"]
+    assert download_manager.queued_roles == ["coding"]
