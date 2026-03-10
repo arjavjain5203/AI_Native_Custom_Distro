@@ -9,8 +9,9 @@ class FakeModelManager:
         self.error = error
         self.calls: list[dict[str, object]] = []
 
-    def get_models(self) -> dict[str, object]:
-        return {"orchestrator": {"ollama": "gemma:2b"}}
+    def get_model_for_role(self, role: str) -> str:
+        assert role in {"orchestrator", "intent"}
+        return "gemma:2b"
 
     def run_model(
         self,
@@ -80,6 +81,28 @@ def test_orchestrator_falls_back_on_model_failure() -> None:
 
     assert decision["task_type"] == "analysis"
     assert decision["agent"] == "analysis"
+
+
+def test_orchestrator_falls_back_to_coding_for_fastapi_app_request() -> None:
+    manager = FakeModelManager(error=OllamaError("ollama unavailable"))
+    orchestrator = Orchestrator(model_manager=manager)
+
+    decision = orchestrator.classify_input("create a fastapi app", {})
+
+    assert decision["mode"] == "execution"
+    assert decision["task_type"] == "coding"
+    assert decision["agent"] == "coding"
+
+
+def test_orchestrator_falls_back_to_system_for_list_files_request() -> None:
+    manager = FakeModelManager(error=OllamaError("ollama unavailable"))
+    orchestrator = Orchestrator(model_manager=manager)
+
+    decision = orchestrator.classify_input("list files in current directory", {})
+
+    assert decision["mode"] == "execution"
+    assert decision["task_type"] == "system"
+    assert decision["agent"] == "planning"
 
 
 def test_orchestrator_updates_session_context_when_session_id_is_provided() -> None:
