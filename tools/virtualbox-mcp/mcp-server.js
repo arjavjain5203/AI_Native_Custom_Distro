@@ -192,7 +192,7 @@ server.registerTool(
   "run_virtualbox_test",
   {
     title: "Run VirtualBox ISO Test",
-    description: "Build the Arch ISO from this repository, attach it to the Aicustom VM, boot it headless, and verify installer/model-install completion through serial console markers.",
+    description: "Build the Arch ISO from this repository, attach it to the Aicustom VM, boot it headless, and verify installer completion plus disk-backed Ollama storage, runtime Ollama generation, and AI-daemon generation checks through serial console markers.",
     inputSchema: {
       vm_name: z.string().default("Aicustom"),
       boot_wait_seconds: z.number().int().positive().default(900)
