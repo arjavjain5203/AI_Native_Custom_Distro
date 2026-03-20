@@ -1,0 +1,13 @@
+[Unit]
+Description=Prepare Persistent Ollama Model Storage
+After=local-fs.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=ollama.service ai-os.service ai-os-installer.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ai-os-prepare-ollama-storage
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
