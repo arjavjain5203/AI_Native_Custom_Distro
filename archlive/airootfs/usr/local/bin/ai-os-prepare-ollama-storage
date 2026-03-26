@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TARGET_DIR="${AI_OS_OLLAMA_STORAGE_DIR:-/var/lib/ollama}"
+MODELS_DIR="${TARGET_DIR}/models"
+DEVICE_LABEL="${AI_OS_OLLAMA_STORAGE_LABEL:-AIOS_OLLAMA}"
+CMDLINE_DEVICE_KEY="ai_os_ollama_device"
+
+log() {
+    printf '[ai-os-ollama-storage] %s\n' "$*"
+}
+
+cmdline_value() {
+    local token
+    for token in $(</proc/cmdline); do
+        case "${token}" in
+            "${CMDLINE_DEVICE_KEY}"=*)
+                printf '%s\n' "${token#*=}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+resolve_device_spec() {
+    local spec="$1"
+    local prefix
+
+    [[ -n "${spec}" ]] || return 1
+    if [[ -b "${spec}" ]]; then
+        readlink -f "${spec}"
+        return 0
+    fi
+
+    for prefix in /dev/disk/by-uuid /dev/disk/by-label /dev/disk/by-id /dev/disk/by-partuuid /dev/disk/by-partlabel; do
+        if [[ -e "${prefix}/${spec}" ]]; then
+            readlink -f "${prefix}/${spec}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+ensure_layout() {
+    mkdir -p "${TARGET_DIR}" "${MODELS_DIR}"
+    if getent passwd ollama >/dev/null 2>&1 && getent group ollama >/dev/null 2>&1; then
+        chown ollama:ollama "${TARGET_DIR}" "${MODELS_DIR}"
+    fi
+}
+
+target_has_persistent_mount() {
+    local source fstype
+
+    source="$(findmnt -n -o SOURCE --target "${TARGET_DIR}" 2>/dev/null || true)"
+    fstype="$(findmnt -n -o FSTYPE --target "${TARGET_DIR}" 2>/dev/null || true)"
+    [[ -n "${source}" && "${source}" != "overlay" && "${fstype}" != "overlay" && "${fstype}" != "tmpfs" ]]
+}
+
+device_has_children() {
+    local device="$1"
+    local lines
+
+    lines="$(lsblk -nrpo NAME "${device}" 2>/dev/null | wc -l)"
+    (( lines > 1 ))
+}
+
+device_is_mounted() {
+    local mountpoints
+
+    mountpoints="$(lsblk -dnro MOUNTPOINTS "$1" 2>/dev/null || true)"
+    [[ -n "${mountpoints// /}" ]]
+}
+
+device_has_filesystem() {
+    local fstype
+
+    fstype="$(blkid -p -o value -s TYPE "$1" 2>/dev/null || true)"
+    [[ -n "${fstype}" ]]
+}
+
+device_is_blank() {
+    if blkid "$1" >/dev/null 2>&1; then
+        return 1
+    fi
+    ! wipefs -n "$1" 2>/dev/null | grep -q .
+}
+
+find_labeled_device() {
+    blkid -L "${DEVICE_LABEL}" 2>/dev/null || true
+}
+
+find_blank_vm_disk() {
+    local device type rm ro
+
+    systemd-detect-virt --quiet || return 1
+    while read -r device type rm ro; do
+        [[ "${type}" == "disk" ]] || continue
+        [[ "${rm}" == "0" && "${ro}" == "0" ]] || continue
+        [[ "${device}" != /dev/loop* && "${device}" != /dev/sr* && "${device}" != /dev/ram* && "${device}" != /dev/zram* ]] || continue
+        device_has_children "${device}" && continue
+        device_is_mounted "${device}" && continue
+        if device_is_blank "${device}"; then
+            printf '%s\n' "${device}"
+            return 0
+        fi
+    done < <(lsblk -dnpro NAME,TYPE,RM,RO)
+
+    return 1
+}
+
+mount_device() {
+    local device="$1"
+
+    mkdir -p "${TARGET_DIR}"
+    mount -o noatime "${device}" "${TARGET_DIR}"
+    ensure_layout
+    log "Mounted ${device} at ${TARGET_DIR}."
+}
+
+format_and_mount_device() {
+    local device="$1"
+
+    log "Formatting blank device ${device} for persistent Ollama storage."
+    mkfs.ext4 -F -L "${DEVICE_LABEL}" "${device}" >/dev/null
+    tune2fs -m 0 "${device}" >/dev/null 2>&1 || true
+    mount_device "${device}"
+}
+
+use_candidate_device() {
+    local device="$1"
+    local allow_format="$2"
+
+    [[ -b "${device}" ]] || return 1
+    device_is_mounted "${device}" && return 1
+
+    if device_has_filesystem "${device}"; then
+        mount_device "${device}"
+        return 0
+    fi
+
+    if [[ "${allow_format}" == "1" ]] && device_is_blank "${device}"; then
+        format_and_mount_device "${device}"
+        return 0
+    fi
+
+    return 1
+}
+
+main() {
+    local source
+    local device_spec=""
+    local resolved_device=""
+    local labeled_device=""
+    local vm_blank_disk=""
+
+    ensure_layout
+    if target_has_persistent_mount; then
+        source="$(findmnt -n -o SOURCE --target "${TARGET_DIR}" 2>/dev/null || true)"
+        log "${TARGET_DIR} is already backed by ${source}."
+        exit 0
+    fi
+
+    device_spec="$(cmdline_value || true)"
+    if [[ -n "${device_spec}" ]]; then
+        resolved_device="$(resolve_device_spec "${device_spec}" || true)"
+        if [[ -n "${resolved_device}" ]] && use_candidate_device "${resolved_device}" "1"; then
+            exit 0
+        fi
+        log "Ignoring unusable ${CMDLINE_DEVICE_KEY} target: ${device_spec}"
+    fi
+
+    labeled_device="$(find_labeled_device)"
+    if [[ -n "${labeled_device}" ]] && use_candidate_device "${labeled_device}" "0"; then
+        exit 0
+    fi
+
+    vm_blank_disk="$(find_blank_vm_disk || true)"
+    if [[ -n "${vm_blank_disk}" ]] && use_candidate_device "${vm_blank_disk}" "1"; then
+        exit 0
+    fi
+
+    log "No safe persistent block device was found for ${TARGET_DIR}; leaving it on the live writable layer."
+}
+
+main "$@"
