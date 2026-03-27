@@ -1,0 +1,68 @@
+# ──────────────────────────────────────────────
+# AI-Native Developer Operating Environment
+# System Configuration
+# ──────────────────────────────────────────────
+
+system:
+  name: "AI-Native Developer OS"
+  version: "0.1.0"
+  log_level: "info"                  # debug | info | warning | error
+  data_dir: "~/.ai-os"
+
+# ── Daemon ──
+daemon:
+  host: "127.0.0.1"
+  port: 8000
+  reload: false
+
+# ── Ollama ──
+ollama:
+  base_url: "http://127.0.0.1:11434"
+  timeout_seconds: 120
+
+# ── Model Assignments ──
+# Each role maps to a specific Ollama model.
+# The system selects models by role during task routing.
+models:
+  runtime: "auto"                    # auto | ollama | airllm
+  low_memory_threshold_gb: 12
+  roles:
+    intent:   "phi3:mini"
+    planning: "gemma:2b"
+    coding:   "qwen2.5-coder:1.5b"
+    analysis: "gemma:2b"
+
+# ── Memory ──
+memory:
+  backend: "sqlite"
+  database: "ai_core.db"
+  vector_store: "faiss"
+
+# ── Tool Engine ──
+tools:
+  max_concurrent: 4
+  shell_timeout_seconds: 30
+  enable_mcp: true
+
+# ── Agents ──
+agents:
+  planner:
+    max_plan_steps: 20
+    require_approval: true
+  executor:
+    retry_on_failure: true
+    max_retries: 2
+  coding:
+    max_file_size_kb: 500
+    retrieval_top_k: 5
+  analysis:
+    include_system_info: true
+
+# ── Plugins ──
+plugins:
+  github:
+    enabled: true
+    # Token is read from GITHUB_TOKEN env var
+  docker:
+    enabled: false
+    binary: "docker"
