@@ -1,0 +1,129 @@
+{
+  "_description": "Tool execution permissions for the AI daemon. Controls which operations require user approval before execution.",
+  "version": "1.0",
+  "default_policy": "prompt",
+  "tools": {
+    "filesystem": {
+      "read_file": {
+        "policy": "allow",
+        "description": "Read file contents — safe, no side effects"
+      },
+      "list_directory": {
+        "policy": "allow",
+        "description": "List directory contents"
+      },
+      "write_file": {
+        "policy": "prompt",
+        "description": "Write or overwrite a file — requires confirmation"
+      },
+      "create_directory": {
+        "policy": "prompt",
+        "description": "Create a new directory"
+      },
+      "delete_file": {
+        "policy": "prompt",
+        "description": "Delete a file — destructive, always confirm"
+      },
+      "move_file": {
+        "policy": "prompt",
+        "description": "Move or rename a file"
+      }
+    },
+    "git": {
+      "git_status": {
+        "policy": "allow",
+        "description": "Check repository status"
+      },
+      "git_diff": {
+        "policy": "allow",
+        "description": "Show working tree diff"
+      },
+      "git_log": {
+        "policy": "allow",
+        "description": "View commit history"
+      },
+      "git_add": {
+        "policy": "prompt",
+        "description": "Stage files for commit"
+      },
+      "git_commit": {
+        "policy": "prompt",
+        "description": "Create a commit"
+      },
+      "git_push": {
+        "policy": "prompt",
+        "description": "Push to remote — requires confirmation"
+      },
+      "git_init": {
+        "policy": "prompt",
+        "description": "Initialize a new repository"
+      }
+    },
+    "shell": {
+      "run_command": {
+        "policy": "prompt",
+        "description": "Execute an arbitrary shell command — always confirm"
+      }
+    },
+    "system": {
+      "system_info": {
+        "policy": "allow",
+        "description": "Read system information"
+      },
+      "install_package": {
+        "policy": "deny",
+        "description": "Install a system package — disabled by default for safety"
+      }
+    },
+    "github": {
+      "create_repo": {
+        "policy": "prompt",
+        "description": "Create a GitHub repository"
+      },
+      "list_repos": {
+        "policy": "allow",
+        "description": "List user repositories"
+      }
+    },
+    "docker": {
+      "build": {
+        "policy": "prompt",
+        "description": "Build a Docker image"
+      },
+      "run": {
+        "policy": "prompt",
+        "description": "Run a Docker container"
+      },
+      "stop": {
+        "policy": "prompt",
+        "description": "Stop a Docker container"
+      },
+      "ps": {
+        "policy": "allow",
+        "description": "List Docker containers"
+      }
+    }
+  },
+  "categories": {
+    "read_only": {
+      "policy": "allow",
+      "description": "Operations that only read data"
+    },
+    "write": {
+      "policy": "prompt",
+      "description": "Operations that modify files or state"
+    },
+    "destructive": {
+      "policy": "prompt",
+      "description": "Operations that delete or overwrite data"
+    },
+    "network": {
+      "policy": "prompt",
+      "description": "Operations that access remote services"
+    },
+    "system": {
+      "policy": "deny",
+      "description": "Operations that modify the system itself"
+    }
+  }
+}
