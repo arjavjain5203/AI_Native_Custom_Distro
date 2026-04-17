@@ -54,3 +54,9 @@ archiso-work/
 
 # Node (if any frontend is added)
 node_modules/
+
+# VirtualBox
+Aicustom/
+
+# History rewrite artifacts
+.history-rewrite*

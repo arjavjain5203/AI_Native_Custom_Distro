@@ -13,21 +13,16 @@ class FakeModelManager:
         assert role in {"orchestrator", "intent"}
         return "gemma:2b"
 
-    def run_model(
+    def run_role_model(
         self,
-        model_name: str,
+        role: str,
         prompt: str,
-        *,
-        runtime: str | None = None,
-        task_type: str | None = None,
         timeout_seconds: float | None = None,
     ) -> str:
         self.calls.append(
             {
-                "model_name": model_name,
+                "role": role,
                 "prompt": prompt,
-                "runtime": runtime,
-                "task_type": task_type,
                 "timeout_seconds": timeout_seconds,
             }
         )
@@ -47,7 +42,7 @@ def test_orchestrator_accepts_valid_model_json() -> None:
 
     assert decision["mode"] == "execution"
     assert decision["task_type"] == "coding"
-    assert manager.calls[0]["runtime"] == "ollama"
+    assert manager.calls[0]["role"] == "orchestrator"
     assert manager.calls[0]["timeout_seconds"] == 4
     assert "current_task_state=" in str(manager.calls[0]["prompt"])
     assert "related_tasks=" in str(manager.calls[0]["prompt"])
