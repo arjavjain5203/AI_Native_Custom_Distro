@@ -104,6 +104,88 @@ def test_registered_git_tool_uses_default_repo_path_from_context(tmp_path, monke
     assert captured["path"] == str(tmp_path.resolve())
 
 
+def test_registered_create_repository_infers_name_from_context(tmp_path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    project_dir = tmp_path / "demo-project"
+    project_dir.mkdir()
+
+    def fake_create_repo(name: str, private: bool = False) -> dict[str, object]:
+        captured["name"] = name
+        captured["private"] = private
+        return {"name": name, "private": private}
+
+    monkeypatch.setattr("ai_core.tools.register_tools.create_repo", fake_create_repo)
+
+    registry = build_tool_registry()
+    result = registry.execute("create_repository", {}, ToolExecutionContext(cwd=str(project_dir)))
+
+    assert result.success is True
+    assert captured == {"name": "demo-project", "private": False}
+
+
+def test_registered_push_changes_uses_github_workflow_without_remote(tmp_path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_github_push_changes(repo_path: str, repo_name: str | None = None, branch: str = "main") -> dict[str, object]:
+        captured["repo_path"] = repo_path
+        captured["repo_name"] = repo_name
+        captured["branch"] = branch
+        return {"owner": "octocat", "repo": repo_name or "demo", "branch": branch}
+
+    monkeypatch.setattr("ai_core.tools.register_tools.github_push_changes", fake_github_push_changes)
+    monkeypatch.setattr("ai_core.tools.register_tools.infer_repo_name", lambda path: "demo")
+
+    registry = build_tool_registry()
+    result = registry.execute("push_changes", {}, ToolExecutionContext(cwd=str(tmp_path)))
+
+    assert result.success is True
+    assert captured == {
+        "repo_path": str(tmp_path.resolve()),
+        "repo_name": "demo",
+        "branch": "main",
+    }
+    assert result.output == "Pushed changes to GitHub repository octocat/demo on branch main."
+
+
+def test_registered_push_changes_uses_plain_git_when_remote_is_provided(tmp_path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_git_push_changes(
+        repo_path: str,
+        remote: str = "origin",
+        branch: str | None = None,
+        *,
+        set_upstream: bool = False,
+        secrets: tuple[str, ...] = (),
+    ) -> str:
+        captured["repo_path"] = repo_path
+        captured["remote"] = remote
+        captured["branch"] = branch
+        captured["set_upstream"] = set_upstream
+        captured["secrets"] = secrets
+        return "pushed"
+
+    monkeypatch.setattr("ai_core.tools.register_tools.git_push_changes", fake_git_push_changes)
+
+    registry = build_tool_registry()
+    result = registry.execute(
+        "push_changes",
+        {"remote": "origin", "branch": "main"},
+        ToolExecutionContext(cwd=str(tmp_path)),
+    )
+
+    assert result.success is True
+    assert result.output == "pushed"
+    assert captured == {
+        "repo_path": str(tmp_path.resolve()),
+        "remote": "origin",
+        "branch": "main",
+        "set_upstream": False,
+        "secrets": (),
+    }
+
+
 def test_build_tool_registry_optionally_registers_mcp_tools() -> None:
     class FakeMCPClient:
         def call_tool(self, tool_name: str, args: dict[str, object]) -> dict[str, object]:

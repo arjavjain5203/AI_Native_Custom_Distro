@@ -13,7 +13,6 @@ from ai_core.tools import (
     create_branch,
     create_file,
     create_folder,
-    create_repository,
     docker_check,
     docker_run_command,
     git_commit,
@@ -22,11 +21,12 @@ from ai_core.tools import (
     pacman_install,
     pacman_query,
     pacman_remove,
-    push_changes,
     read_file,
     update_file,
     write_file,
 )
+from ai_core.tools.git_tools import push_changes as git_push_changes
+from ai_core.tools.github_tools import create_repo, infer_repo_name, push_changes as github_push_changes
 
 
 ToolHandler = Callable[[PlanStep, str | None], Any]
@@ -167,15 +167,22 @@ class ExecutorAgent:
         return create_branch(self._resolve_repo_path(cwd), branch_name)
 
     def _handle_push_changes(self, step: PlanStep, cwd: str | None) -> str:
-        remote = str(step.args.get("remote", "origin")).strip() or "origin"
+        repo_path = self._resolve_repo_path(cwd)
+        remote = str(step.args.get("remote", "")).strip() or None
         branch = str(step.args.get("branch", "")).strip() or None
-        return push_changes(self._resolve_repo_path(cwd), remote=remote, branch=branch)
+        if remote:
+            return git_push_changes(repo_path, remote=remote, branch=branch)
+        result = github_push_changes(
+            repo_path,
+            repo_name=str(step.args.get("repo_name", "")).strip() or infer_repo_name(repo_path),
+            branch=branch or "main",
+        )
+        return f"Pushed changes to GitHub repository {result['owner']}/{result['repo']} on branch {result['branch']}."
 
     def _handle_create_repository(self, step: PlanStep, cwd: str | None) -> dict[str, Any]:
-        name = str(step.args.get("name", "")).strip()
-        if not name:
-            raise ValueError("create_repository requires a name")
-        return create_repository(name=name, private=bool(step.args.get("private", False)))
+        repo_path = self._resolve_repo_path(cwd)
+        name = str(step.args.get("name", "")).strip() or infer_repo_name(repo_path)
+        return create_repo(name, private=bool(step.args.get("private", False)))
 
     def _handle_pacman_install(self, step: PlanStep, cwd: str | None) -> str:
         package_name = str(step.args.get("package", "")).strip()

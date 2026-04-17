@@ -8,8 +8,14 @@ from typing import Any
 from ai_core.mcp import MCPClient
 
 from .filesystem import create_file, create_folder, list_files, read_file, update_file, write_file
-from .git_tools import clone_repo, create_branch, git_commit, git_init, push_changes
-from .github_tools import create_branch_reference, create_repository, push_file_contents
+from .git_tools import clone_repo, create_branch, git_commit, git_init, push_changes as git_push_changes
+from .github_tools import (
+    create_branch_reference,
+    create_repo,
+    infer_repo_name,
+    push_changes as github_push_changes,
+    push_file_contents,
+)
 from .mcp_tools import register_mcp_tools
 from .registry import ToolDefinition, ToolExecutionContext, ToolRegistry
 from .shell import run_shell_command
@@ -158,6 +164,7 @@ def register_all_tools(registry: ToolRegistry, *, mcp_client: MCPClient | None =
             handler=_handle_push_changes,
             args_schema={
                 "path": {"type": "string", "required": False},
+                "repo_name": {"type": "string", "required": False},
                 "remote": {"type": "string", "required": False},
                 "branch": {"type": "string", "required": False},
             },
@@ -172,9 +179,9 @@ def register_all_tools(registry: ToolRegistry, *, mcp_client: MCPClient | None =
             name="create_repository",
             handler=_handle_create_repository,
             args_schema={
-                "name": {"type": "string", "required": True},
+                "path": {"type": "string", "required": False},
+                "name": {"type": "string", "required": False},
                 "private": {"type": "bool", "required": False},
-                "token": {"type": "string", "required": False},
             },
             requires_approval=True,
             rollback_supported=True,
@@ -191,7 +198,6 @@ def register_all_tools(registry: ToolRegistry, *, mcp_client: MCPClient | None =
                 "repo": {"type": "string", "required": True},
                 "branch_name": {"type": "string", "required": True},
                 "from_sha": {"type": "string", "required": True},
-                "token": {"type": "string", "required": False},
             },
             requires_approval=True,
             rollback_supported=False,
@@ -210,7 +216,6 @@ def register_all_tools(registry: ToolRegistry, *, mcp_client: MCPClient | None =
                 "content": {"type": "string", "required": True},
                 "message": {"type": "string", "required": True},
                 "branch": {"type": "string", "required": False},
-                "token": {"type": "string", "required": False},
             },
             requires_approval=True,
             rollback_supported=False,
@@ -339,19 +344,29 @@ def _handle_create_branch(args: dict[str, Any], context: ToolExecutionContext) -
 
 def _handle_push_changes(args: dict[str, Any], context: ToolExecutionContext) -> str:
     branch = str(args.get("branch", "")).strip() or None
-    remote = str(args.get("remote", "origin")).strip() or "origin"
-    return push_changes(
-        _resolve_optional_repo_path(args.get("path"), context),
-        remote=remote,
-        branch=branch,
+    repo_path = _resolve_optional_repo_path(args.get("path"), context)
+    remote = _optional_string(args.get("remote"))
+    if remote:
+        return git_push_changes(
+            repo_path,
+            remote=remote,
+            branch=branch,
+        )
+    repo_name = _optional_string(args.get("repo_name")) or infer_repo_name(repo_path)
+    result = github_push_changes(
+        repo_path,
+        repo_name=repo_name,
+        branch=branch or "main",
     )
+    return f"Pushed changes to GitHub repository {result['owner']}/{result['repo']} on branch {result['branch']}."
 
 
 def _handle_create_repository(args: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
-    return create_repository(
-        name=str(args["name"]),
+    repo_path = _resolve_optional_repo_path(args.get("path"), context)
+    repo_name = _optional_string(args.get("name")) or infer_repo_name(repo_path)
+    return create_repo(
+        repo_name,
         private=bool(args.get("private", False)),
-        token=_optional_string(args.get("token")),
     )
 
 
@@ -361,7 +376,6 @@ def _handle_create_branch_reference(args: dict[str, Any], context: ToolExecution
         repo=str(args["repo"]),
         branch_name=str(args["branch_name"]),
         from_sha=str(args["from_sha"]),
-        token=_optional_string(args.get("token")),
     )
 
 
@@ -374,7 +388,6 @@ def _handle_push_file_contents(args: dict[str, Any], context: ToolExecutionConte
         content=str(args["content"]),
         message=str(args["message"]),
         branch=branch,
-        token=_optional_string(args.get("token")),
     )
 
 

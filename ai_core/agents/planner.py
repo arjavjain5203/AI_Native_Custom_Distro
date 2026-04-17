@@ -191,6 +191,30 @@ User command: {command}
             message = commit_match.group(1).strip().strip("\"'")
             return [self._executor_step(f"Commit repository changes with message: {message}", "git_commit", {"message": message})]
 
+        if re.search(r"\bpush\b.*\bgithub\b", cleaned, re.IGNORECASE):
+            return [
+                self._executor_step("Initialize git repository", "git_init", {}),
+                self._executor_step(
+                    "Create GitHub repository for the current project",
+                    "create_repository",
+                    {},
+                    requires_approval=True,
+                    approval_category="git_push",
+                ),
+                self._executor_step(
+                    "Commit repository changes",
+                    "git_commit",
+                    {"message": "AI OS automated commit"},
+                ),
+                self._executor_step(
+                    "Push repository changes to GitHub",
+                    "push_changes",
+                    {},
+                    requires_approval=True,
+                    approval_category="git_push",
+                ),
+            ]
+
         clone_match = re.match(r"^clone\s+repo\s+(.+)$", cleaned, re.IGNORECASE)
         if clone_match:
             repo_url = clone_match.group(1).strip()
@@ -207,7 +231,7 @@ User command: {command}
                 self._executor_step(
                     "Push repository changes",
                     "push_changes",
-                    {},
+                    {"remote": "origin"},
                     requires_approval=True,
                     approval_category="git_push",
                 )

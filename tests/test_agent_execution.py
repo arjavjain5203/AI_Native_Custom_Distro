@@ -74,6 +74,26 @@ class TestPlannerAgent:
         assert steps[0].tool_name == "read_file"
         assert steps[0].args["path"] == "main.py"
 
+    def test_planner_fallback_push_to_github(self) -> None:
+        """A 'push to github' command should produce the secure git/GitHub workflow."""
+        from ai_core.agents.planner import PlannerAgent
+        from ai_core.models.manager import ModelManagerError
+
+        mock_manager = MagicMock()
+        mock_manager.run_role_model.side_effect = ModelManagerError("no model")
+        planner = PlannerAgent(model_manager=mock_manager)
+
+        steps = planner.plan("push to github")
+        assert [step.tool_name for step in steps] == [
+            "git_init",
+            "create_repository",
+            "git_commit",
+            "push_changes",
+        ]
+        assert steps[1].requires_approval is True
+        assert steps[3].requires_approval is True
+        assert steps[2].args["message"] == "AI OS automated commit"
+
 
 class TestExecutorAgent:
     """Validate ExecutorAgent behavior."""
