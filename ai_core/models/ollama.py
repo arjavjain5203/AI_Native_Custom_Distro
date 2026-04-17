@@ -25,6 +25,7 @@ class OllamaClient:
         prompt: str,
         model: str | None = None,
         timeout_seconds: float | None = None,
+        keep_alive: str | int | None = None,
     ) -> str:
         """Generate a non-streaming response from Ollama."""
         payload = {
@@ -32,6 +33,8 @@ class OllamaClient:
             "prompt": prompt,
             "stream": False,
         }
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
         response = self._post_json("/api/generate", payload, timeout_seconds=timeout_seconds)
         text = response.get("response")
         if isinstance(text, str) and text.strip():
@@ -39,6 +42,43 @@ class OllamaClient:
 
         payload["stream"] = True
         return self._post_json_stream("/api/generate", payload, timeout_seconds=timeout_seconds)
+
+    def load_model(
+        self,
+        model: str,
+        *,
+        keep_alive: str | int = "30s",
+        timeout_seconds: float | None = None,
+    ) -> None:
+        """Warm-load a model into memory with a bounded keep-alive."""
+        self._post_json(
+            "/api/generate",
+            {
+                "model": model,
+                "prompt": "",
+                "stream": False,
+                "keep_alive": keep_alive,
+            },
+            timeout_seconds=timeout_seconds,
+        )
+
+    def unload_model(
+        self,
+        model: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        """Explicitly evict a model from memory."""
+        self._post_json(
+            "/api/generate",
+            {
+                "model": model,
+                "prompt": "",
+                "stream": False,
+                "keep_alive": 0,
+            },
+            timeout_seconds=timeout_seconds,
+        )
 
     def list_installed_models(self, *, timeout_seconds: float | None = None) -> set[str]:
         """Return the set of locally installed Ollama model tags."""
@@ -55,6 +95,22 @@ class OllamaClient:
             if isinstance(name, str) and name.strip():
                 installed.add(name.strip())
         return installed
+
+    def list_running_models(self, *, timeout_seconds: float | None = None) -> set[str]:
+        """Return the set of currently loaded Ollama model tags."""
+        payload = self._get_json("/api/ps", timeout_seconds=timeout_seconds)
+        models = payload.get("models", [])
+        if not isinstance(models, list):
+            raise OllamaError(f"ollama returned invalid ps payload: {payload}")
+
+        loaded: set[str] = set()
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            name = model.get("name")
+            if isinstance(name, str) and name.strip():
+                loaded.add(name.strip())
+        return loaded
 
     def pull_model_progress(
         self,

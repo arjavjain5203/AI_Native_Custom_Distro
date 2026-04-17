@@ -8,15 +8,40 @@ from ai_core.models.manager import ModelManager, ModelManagerError, ModelState
 
 class FakeOllamaClient:
     def __init__(self, installed_models: set[str] | None = None) -> None:
-        self.calls: list[tuple[str, str, float | None]] = []
+        self.calls: list[tuple[str, str, float | None, str | int | None]] = []
         self.installed_models = installed_models or set()
+        self.running_models: set[str] = set()
+        self.load_calls: list[tuple[str, str | int, float | None]] = []
+        self.unload_calls: list[tuple[str, float | None]] = []
 
-    def generate(self, prompt: str, model: str | None = None, timeout_seconds: float | None = None) -> str:
-        self.calls.append((prompt, model or "", timeout_seconds))
+    def generate(
+        self,
+        prompt: str,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+        keep_alive: str | int | None = None,
+    ) -> str:
+        self.calls.append((prompt, model or "", timeout_seconds, keep_alive))
+        if model is not None:
+            if keep_alive == 0:
+                self.running_models.discard(model)
+            else:
+                self.running_models.add(model)
         return f"ollama:{model}"
 
     def list_installed_models(self) -> set[str]:
         return set(self.installed_models)
+
+    def list_running_models(self) -> set[str]:
+        return set(self.running_models)
+
+    def load_model(self, model: str, *, keep_alive: str | int = "30s", timeout_seconds: float | None = None) -> None:
+        self.load_calls.append((model, keep_alive, timeout_seconds))
+        self.running_models.add(model)
+
+    def unload_model(self, model: str, *, timeout_seconds: float | None = None) -> None:
+        self.unload_calls.append((model, timeout_seconds))
+        self.running_models.discard(model)
 
 
 class FakeAirLLMClient:
@@ -172,7 +197,7 @@ def test_model_manager_routes_to_correct_runtime_backend(tmp_path: Path) -> None
     assert air_output == "airllm:mistral-air"
     assert ollama_output == "ollama:gemma:2b"
     assert airllm.calls == [("plan task", "mistral-air")]
-    assert ollama.calls == [("route task", "gemma:2b", None)]
+    assert ollama.calls == [("route task", "gemma:2b", None, None)]
 
 
 def test_model_manager_runtime_status_exposes_hardware_info(tmp_path: Path) -> None:
@@ -259,3 +284,42 @@ def test_model_manager_tracks_download_and_failure_state(tmp_path: Path) -> None
     manager.mark_model_installed("planning", "mistral:7b")
     assert manager.get_model_state("planning") == ModelState.INSTALLED
     assert manager.is_model_available("planning") is True
+
+
+def test_model_manager_pins_orchestrator_and_reports_loaded_state(tmp_path: Path) -> None:
+    manager, ollama, _ = build_manager(
+        tmp_path,
+        user_payload={"runtime": "ollama", "intent": {"ollama": "phi3:mini"}},
+        installed_models={"phi3:mini"},
+    )
+
+    pinned = manager.ensure_orchestrator_pinned()
+
+    assert pinned is True
+    assert ollama.load_calls == [("phi3:mini", "-1", None)]
+    assert manager.is_model_loaded("intent") is True
+    assert manager.is_model_pinned("intent") is True
+    payload = manager.get_models()
+    assert payload["intent"]["loaded"] is True
+    assert payload["intent"]["pinned"] is True
+
+
+def test_model_manager_unloads_ephemeral_role_after_execution(tmp_path: Path) -> None:
+    manager, ollama, _ = build_manager(
+        tmp_path,
+        user_payload={
+            "runtime": "ollama",
+            "intent": {"ollama": "phi3:mini"},
+            "planning": {"ollama": "mistral:7b"},
+        },
+        installed_models={"phi3:mini", "mistral:7b"},
+    )
+
+    output = manager.run_role_model("planning", "plan task")
+
+    assert output == "ollama:mistral:7b"
+    assert ollama.load_calls == []
+    assert ollama.calls == [("plan task", "mistral:7b", None, 0)]
+    assert ollama.unload_calls == [("mistral:7b", None)]
+    assert manager.is_model_loaded("planning") is False
+    assert manager.is_model_pinned("planning") is False

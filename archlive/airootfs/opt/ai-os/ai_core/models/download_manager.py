@@ -138,6 +138,11 @@ class ModelDownloadManager:
                 self._stop_event.wait(self.idle_sleep_seconds)
                 continue
 
+            try:
+                self.model_manager.ensure_orchestrator_pinned()
+            except ModelManagerError:
+                pass
+
             self.ensure_configured_bundle_queued()
             item = self._pop_next_item()
             if item is None:
@@ -184,6 +189,11 @@ class ModelDownloadManager:
                         )
                     self.model_manager.refresh_installed_models()
                     self.model_manager.mark_model_installed(item.role, item.model_name)
+                    if item.role == "orchestrator":
+                        try:
+                            self.model_manager.ensure_orchestrator_pinned()
+                        except ModelManagerError:
+                            pass
                     return
                 except (ModelManagerError, OllamaError, RuntimeError) as exc:
                     last_error = str(exc)

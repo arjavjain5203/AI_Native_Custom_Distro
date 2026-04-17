@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import sys
 from typing import Any
 from urllib import error, request
@@ -16,19 +17,26 @@ class CliError(RuntimeError):
     """Raised when the CLI cannot complete a daemon request."""
 
 
+DEFAULT_HTTP_TIMEOUT_SECONDS = float(os.environ.get("AI_OS_HTTP_TIMEOUT_SECONDS", "60"))
+DEFAULT_TASK_TIMEOUT_SECONDS = float(os.environ.get("AI_OS_TASK_TIMEOUT_SECONDS", "300"))
+GREETING_TOKENS = {"hi", "hello", "hey", "hii", "yo"}
+
+
 def _build_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
 def _http_get_json(url: str) -> dict[str, Any]:
     try:
-        with request.urlopen(url, timeout=10) as response:
+        with request.urlopen(url, timeout=DEFAULT_HTTP_TIMEOUT_SECONDS) as response:
             payload = response.read().decode("utf-8")
     except error.HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
         raise CliError(f"daemon returned HTTP {exc.code}: {details}") from exc
     except error.URLError as exc:
         raise CliError(f"could not reach daemon at {url}: {exc.reason}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise CliError(f"request to daemon timed out after {int(DEFAULT_HTTP_TIMEOUT_SECONDS)} seconds: {url}") from exc
 
     try:
         return json.loads(payload)
@@ -36,7 +44,7 @@ def _http_get_json(url: str) -> dict[str, Any]:
         raise CliError(f"daemon returned invalid JSON: {payload}") from exc
 
 
-def _http_post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _http_post_json(url: str, payload: dict[str, Any], *, timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SECONDS) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     http_request = request.Request(
         url,
@@ -46,13 +54,15 @@ def _http_post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     try:
-        with request.urlopen(http_request, timeout=60) as response:
+        with request.urlopen(http_request, timeout=timeout_seconds) as response:
             raw = response.read().decode("utf-8")
     except error.HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
         raise CliError(f"daemon returned HTTP {exc.code}: {details}") from exc
     except error.URLError as exc:
         raise CliError(f"could not reach daemon at {url}: {exc.reason}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise CliError(f"request to daemon timed out after {int(timeout_seconds)} seconds: {url}") from exc
 
     try:
         return json.loads(raw)
@@ -80,6 +90,7 @@ def submit_task(command: str, base_url: str) -> dict[str, Any]:
     return _http_post_json(
         _build_url(base_url, "/task"),
         {"command": command, "cwd": os.getcwd()},
+        timeout_seconds=DEFAULT_TASK_TIMEOUT_SECONDS,
     )
 
 
@@ -135,6 +146,102 @@ def _print_json(response: Any) -> None:
     print(json.dumps(response, indent=2))
 
 
+def _is_task_response(response: Any) -> bool:
+    if not isinstance(response, dict):
+        return False
+    required_keys = {"task_id", "status", "success", "command", "cwd", "result"}
+    return required_keys.issubset(response.keys())
+
+
+def _print_task_summary_if_available(response: Any) -> None:
+    summary = _summarize_task_response(response)
+    if summary:
+        print(summary)
+
+
+def _summarize_task_response(response: Any) -> str | None:
+    if not _is_task_response(response):
+        return None
+    assert isinstance(response, dict)
+
+    command = str(response.get("command", "")).strip()
+    result = response.get("result", {})
+    if not isinstance(result, dict):
+        result = {}
+
+    conversation = result.get("conversation", {})
+    if isinstance(conversation, dict):
+        greeting = _greeting_summary(command)
+        if greeting:
+            return greeting
+        message = conversation.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+
+    success = bool(response.get("success"))
+    files_modified = result.get("files_modified", [])
+    if not isinstance(files_modified, list):
+        files_modified = []
+    files_modified = [str(path).strip() for path in files_modified if isinstance(path, str) and str(path).strip()]
+
+    steps_completed = result.get("steps_completed", [])
+    if not isinstance(steps_completed, list):
+        steps_completed = []
+
+    if success and files_modified:
+        single_path = files_modified[0] if len(files_modified) == 1 else None
+        if single_path is not None:
+            if _is_create_folder_step(steps_completed):
+                return f'I have successfully created the folder "{single_path}".'
+            if _is_create_file_step(steps_completed):
+                return f'I have successfully created the file "{single_path}".'
+            return f'I have successfully updated "{single_path}".'
+
+        joined = ", ".join(f'"{path}"' for path in files_modified[:3])
+        if len(files_modified) > 3:
+            return f'I have successfully updated {len(files_modified)} paths, including {joined}.'
+        return f"I have successfully updated {joined}."
+
+    message = response.get("message")
+    if isinstance(message, str) and message.strip() and message.strip() != "Task completed successfully.":
+        if success:
+            return message.strip()
+        return f"Task failed: {message.strip()}"
+
+    errors = result.get("errors", [])
+    if isinstance(errors, list):
+        for error_entry in errors:
+            if isinstance(error_entry, dict):
+                error_message = error_entry.get("message")
+                if isinstance(error_message, str) and error_message.strip():
+                    return f"Task failed: {error_message.strip()}"
+
+    if success:
+        return "Task completed successfully."
+    return "Task failed."
+
+
+def _greeting_summary(command: str) -> str | None:
+    normalized = " ".join(command.lower().split())
+    if normalized in GREETING_TOKENS:
+        return "Hello."
+    return None
+
+
+def _is_create_folder_step(steps_completed: list[Any]) -> bool:
+    if len(steps_completed) != 1:
+        return False
+    step = steps_completed[0]
+    return isinstance(step, dict) and step.get("tool_name") == "create_folder"
+
+
+def _is_create_file_step(steps_completed: list[Any]) -> bool:
+    if len(steps_completed) != 1:
+        return False
+    step = steps_completed[0]
+    return isinstance(step, dict) and step.get("tool_name") == "create_file"
+
+
 def _resolve_approval_if_needed(response: dict[str, Any], base_url: str) -> dict[str, Any]:
     current = response
     while current.get("status") == "pending_approval":
@@ -178,7 +285,9 @@ def _interactive_loop(base_url: str) -> int:
             return 0
 
         try:
-            _print_json(_dispatch_command(command.split(), base_url))
+            response = _dispatch_command(command.split(), base_url)
+            _print_json(response)
+            _print_task_summary_if_available(response)
         except CliError as exc:
             print(f"Error: {exc}", file=sys.stderr)
 
@@ -263,7 +372,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command:
         try:
-            _print_json(_dispatch_command(args.command, args.base_url))
+            response = _dispatch_command(args.command, args.base_url)
+            _print_json(response)
+            _print_task_summary_if_available(response)
             return 0
         except CliError as exc:
             print(f"Error: {exc}", file=sys.stderr)

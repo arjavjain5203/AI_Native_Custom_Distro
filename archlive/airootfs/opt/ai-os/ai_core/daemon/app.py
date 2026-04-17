@@ -185,6 +185,10 @@ def create_app(
     async def lifespan(_: FastAPI):
         download_manager.start()
         try:
+            model_manager.ensure_orchestrator_pinned()
+        except RuntimeError:
+            pass
+        try:
             yield
         finally:
             download_manager.stop()

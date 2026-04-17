@@ -42,11 +42,9 @@ class Orchestrator:
         cleaned = user_input.strip()
         context = self._merge_context(session_id, context or {})
         try:
-            model_name = self._get_orchestrator_model()
-            response = self.model_manager.run_model(
-                model_name,
+            response = self.model_manager.run_role_model(
+                "orchestrator",
                 self._build_prompt(cleaned, context),
-                runtime="ollama",
                 timeout_seconds=self.timeout_seconds,
             )
             decision = self._parse_and_validate_response(response)
@@ -58,9 +56,6 @@ class Orchestrator:
             fallback = self.fallback_classification(cleaned, context, session_id=session_id)
             logger.info("Orchestrator fallback decision: %s", fallback)
             return fallback
-
-    def _get_orchestrator_model(self) -> str:
-        return self.model_manager.get_model_for_role("orchestrator")
 
     def _build_prompt(self, user_input: str, context: dict[str, Any]) -> str:
         recent_messages = context.get("recent_messages", [])

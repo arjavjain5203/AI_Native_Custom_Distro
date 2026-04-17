@@ -19,22 +19,55 @@ from ai_core.tools import ToolDefinition, ToolExecutionContext, ToolRegistry, bu
 
 
 class FailingOllamaClient:
-    def generate(self, prompt: str, model: str | None = None) -> str:
+    def generate(
+        self,
+        prompt: str,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+        keep_alive: str | int | None = None,
+    ) -> str:
         raise OllamaError("ollama unavailable")
 
     def list_installed_models(self) -> set[str]:
         return set()
 
+    def list_running_models(self) -> set[str]:
+        return set()
+
+    def load_model(self, model: str, *, keep_alive: str | int = "30s", timeout_seconds: float | None = None) -> None:
+        raise OllamaError("ollama unavailable")
+
+    def unload_model(self, model: str, *, timeout_seconds: float | None = None) -> None:
+        return None
+
 
 class InstalledModelsOllamaClient:
     def __init__(self, installed_models: set[str] | None = None) -> None:
         self.installed_models = installed_models or {"phi3:mini", "gemma:2b", "mistral:7b", "qwen2.5-coder:1.5b"}
+        self.running_models: set[str] = set()
 
-    def generate(self, prompt: str, model: str | None = None, timeout_seconds: float | None = None) -> str:
+    def generate(
+        self,
+        prompt: str,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+        keep_alive: str | int | None = None,
+    ) -> str:
+        if model is not None and keep_alive != 0:
+            self.running_models.add(model)
         return "[]"
 
     def list_installed_models(self) -> set[str]:
         return set(self.installed_models)
+
+    def list_running_models(self) -> set[str]:
+        return set(self.running_models)
+
+    def load_model(self, model: str, *, keep_alive: str | int = "30s", timeout_seconds: float | None = None) -> None:
+        self.running_models.add(model)
+
+    def unload_model(self, model: str, *, timeout_seconds: float | None = None) -> None:
+        self.running_models.discard(model)
 
 
 class RecordingRouter:

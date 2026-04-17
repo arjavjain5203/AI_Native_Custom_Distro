@@ -17,12 +17,32 @@ class FakeDownloadOllamaClient:
         self.failures_before_success = failures_before_success or {}
         self.pull_calls: list[str] = []
         self.pull_attempts: dict[str, int] = {}
+        self.running_models: set[str] = set()
+        self.load_calls: list[tuple[str, str | int, float | None]] = []
+        self.unload_calls: list[tuple[str, float | None]] = []
 
-    def generate(self, prompt: str, model: str | None = None, timeout_seconds: float | None = None) -> str:
+    def generate(
+        self,
+        prompt: str,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+        keep_alive: str | int | None = None,
+    ) -> str:
         return "[]"
 
     def list_installed_models(self) -> set[str]:
         return set(self.installed_models)
+
+    def list_running_models(self) -> set[str]:
+        return set(self.running_models)
+
+    def load_model(self, model: str, *, keep_alive: str | int = "30s", timeout_seconds: float | None = None) -> None:
+        self.load_calls.append((model, keep_alive, timeout_seconds))
+        self.running_models.add(model)
+
+    def unload_model(self, model: str, *, timeout_seconds: float | None = None) -> None:
+        self.unload_calls.append((model, timeout_seconds))
+        self.running_models.discard(model)
 
     def pull_model_progress(self, model: str, *, timeout_seconds: float | None = None):
         self.pull_calls.append(model)
@@ -93,6 +113,8 @@ def test_download_manager_waits_for_activation_and_preserves_priority_order(tmp_
         assert manager.get_model_state("intent") == ModelState.INSTALLED
         assert manager.get_model_state("planning") == ModelState.INSTALLED
         assert manager.get_model_state("analysis") == ModelState.INSTALLED
+        assert ("phi3:mini", "-1", None) in ollama.load_calls
+        assert manager.is_model_loaded("intent") is True
     finally:
         download_manager.stop()
 

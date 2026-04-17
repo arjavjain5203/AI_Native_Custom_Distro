@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from enum import Enum
 from pathlib import Path
@@ -46,6 +47,11 @@ ROLE_BY_TASK_TYPE = {
     "system": "planning",
     "analysis": "analysis",
 }
+ORCHESTRATOR_KEEP_ALIVE = "-1"
+ROLE_LOAD_KEEP_ALIVE = "30s"
+ROLE_EXECUTION_KEEP_ALIVE = 0
+
+logger = logging.getLogger(__name__)
 
 
 class ModelState(str, Enum):
@@ -83,6 +89,8 @@ class ModelManager:
         self.low_memory_threshold_gb = low_memory_threshold_gb
         self._state_lock = threading.RLock()
         self._installed_models_cache: set[str] = set()
+        self._loaded_models_cache: set[str] = set()
+        self._pinned_models: set[str] = set()
         self._downloading_models: dict[str, dict[str, Any]] = {}
         self._failed_models: dict[str, str] = {}
         if hardware_provider is not None:
@@ -100,6 +108,11 @@ class ModelManager:
         except ModelManagerError:
             # Startup should remain non-blocking when Ollama is not ready yet.
             pass
+        try:
+            self.refresh_loaded_models()
+        except ModelManagerError:
+            # Loaded-model inspection should not block startup either.
+            pass
 
     def get_models(self) -> dict[str, Any]:
         """Return the effective model configuration plus lifecycle status."""
@@ -110,6 +123,10 @@ class ModelManager:
             self.refresh_installed_models()
         except ModelManagerError as exc:
             installed_models_error = str(exc)
+        try:
+            self.refresh_loaded_models()
+        except ModelManagerError:
+            pass
         for role in CANONICAL_ROLES:
             payload[self._public_role_name(role)] = self._build_role_status(
                 role,
@@ -303,6 +320,14 @@ class ModelManager:
                     self._failed_models.pop(model_name, None)
             return set(self._installed_models_cache)
 
+    def refresh_loaded_models(self) -> set[str]:
+        """Refresh the loaded-model cache from Ollama."""
+        loaded = self._list_running_ollama_models()
+        with self._state_lock:
+            self._loaded_models_cache = set(loaded)
+            self._pinned_models.intersection_update(self._loaded_models_cache)
+            return set(self._loaded_models_cache)
+
     def mark_model_downloading(
         self,
         role: str,
@@ -345,6 +370,77 @@ class ModelManager:
         with self._state_lock:
             self._failed_models.pop(model_name, None)
 
+    def is_model_loaded(self, role: str) -> bool:
+        """Return whether the role model is currently resident in Ollama memory."""
+        canonical_role = self._canonical_role_name(role)
+        runtime = self.get_runtime_for_role(canonical_role)
+        if runtime != "ollama":
+            return False
+
+        try:
+            self.refresh_loaded_models()
+        except ModelManagerError:
+            pass
+
+        model_name = self._get_model_for_role(canonical_role, runtime)
+        with self._state_lock:
+            return model_name in self._loaded_models_cache
+
+    def is_model_pinned(self, role: str) -> bool:
+        """Return whether the role model is intentionally kept resident."""
+        canonical_role = self._canonical_role_name(role)
+        runtime = self.get_runtime_for_role(canonical_role)
+        if runtime != "ollama":
+            return False
+
+        model_name = self._get_model_for_role(canonical_role, runtime)
+        with self._state_lock:
+            return model_name in self._pinned_models
+
+    def ensure_orchestrator_pinned(self) -> bool:
+        """Warm-load and pin the orchestrator in memory when it is installed."""
+        return self._ensure_role_residency("orchestrator", pin=True)
+
+    def ensure_role_loaded_for_execution(self, role: str) -> bool:
+        """Validate a role model is ready for execution without preloading it twice."""
+        canonical_role = self._canonical_role_name(role)
+        if canonical_role == "orchestrator":
+            return self.ensure_orchestrator_pinned()
+        runtime = self.get_runtime_for_role(canonical_role)
+        if runtime != "ollama":
+            return False
+        model_name = self._get_model_for_role(canonical_role, runtime)
+        self._require_installed_ollama_model(model_name, role=canonical_role)
+        return False
+
+    def release_role_after_execution(self, role: str) -> bool:
+        """Unload an ephemeral role model after its work completes."""
+        canonical_role = self._canonical_role_name(role)
+        runtime = self.get_runtime_for_role(canonical_role)
+        if runtime != "ollama":
+            return False
+        if canonical_role == "orchestrator":
+            return self.ensure_orchestrator_pinned()
+
+        model_name = self._get_model_for_role(canonical_role, runtime)
+        orchestrator_model = self._get_model_for_role("orchestrator", self.get_runtime_for_role("orchestrator"))
+        if model_name == orchestrator_model:
+            with self._state_lock:
+                self._loaded_models_cache.add(model_name)
+                self._pinned_models.add(model_name)
+            return False
+
+        try:
+            self.ollama_client.unload_model(model_name)
+        except RuntimeError as exc:
+            logger.warning("Failed to unload role model %s for %s: %s", model_name, canonical_role, exc)
+            return False
+
+        with self._state_lock:
+            self._loaded_models_cache.discard(model_name)
+            self._pinned_models.discard(model_name)
+        return True
+
     def run_role_model(
         self,
         role: str,
@@ -376,16 +472,31 @@ class ModelManager:
     ) -> str:
         """Run a model through the selected backend."""
         selected_runtime = self._resolve_runtime_argument(runtime, task_type, role, model_name)
+        effective_role = self._resolve_execution_role(role=role, task_type=task_type, model_name=model_name, runtime=selected_runtime)
 
         if selected_runtime == "ollama":
-            self._require_installed_ollama_model(model_name, task_type=task_type, role=role)
-            if timeout_seconds is None:
-                return self.ollama_client.generate(prompt, model=model_name)
-            return self.ollama_client.generate(
-                prompt,
-                model=model_name,
-                timeout_seconds=timeout_seconds,
-            )
+            self._require_installed_ollama_model(model_name, task_type=task_type, role=effective_role or role)
+            if effective_role == "orchestrator":
+                self.ensure_orchestrator_pinned()
+            elif effective_role is not None:
+                self.ensure_role_loaded_for_execution(effective_role)
+
+            try:
+                if timeout_seconds is None:
+                    return self.ollama_client.generate(
+                        prompt,
+                        model=model_name,
+                        keep_alive=self._keep_alive_for_role(effective_role),
+                    )
+                return self.ollama_client.generate(
+                    prompt,
+                    model=model_name,
+                    timeout_seconds=timeout_seconds,
+                    keep_alive=self._keep_alive_for_role(effective_role),
+                )
+            finally:
+                if effective_role is not None and effective_role != "orchestrator":
+                    self.release_role_after_execution(effective_role)
         if selected_runtime == "airllm":
             return self.airllm_client.generate(prompt, model=model_name)
 
@@ -516,6 +627,8 @@ class ModelManager:
         error: str | None = None
         model_name: str | None = None
         installed = False
+        loaded = False
+        pinned = False
         public_role = self._public_role_name(role)
         state = ModelState.NOT_INSTALLED
         progress: dict[str, Any] | None = None
@@ -526,6 +639,8 @@ class ModelManager:
             state = self.get_model_state(role)
             progress = self.get_model_progress(role)
             installed = state == ModelState.INSTALLED or runtime != "ollama"
+            loaded = self.is_model_loaded(role) if runtime == "ollama" else False
+            pinned = self.is_model_pinned(role) if runtime == "ollama" else False
             if runtime == "ollama":
                 if state == ModelState.FAILED:
                     error = self.get_model_error(role) or "download failed"
@@ -541,6 +656,8 @@ class ModelManager:
             "runtime": runtime,
             "model_name": model_name,
             "installed": installed,
+            "loaded": loaded,
+            "pinned": pinned,
             "state": state.value,
         }
         if progress is not None:
@@ -584,6 +701,67 @@ class ModelManager:
             raise ModelManagerError("ollama client does not support installed model lookup") from exc
         except RuntimeError as exc:
             raise ModelManagerError(str(exc)) from exc
+
+    def _list_running_ollama_models(self) -> set[str]:
+        try:
+            return self.ollama_client.list_running_models()
+        except AttributeError as exc:
+            raise ModelManagerError("ollama client does not support running model lookup") from exc
+        except RuntimeError as exc:
+            raise ModelManagerError(str(exc)) from exc
+
+    def _ensure_role_residency(self, role: str, *, pin: bool) -> bool:
+        canonical_role = self._canonical_role_name(role)
+        runtime = self.get_runtime_for_role(canonical_role)
+        if runtime != "ollama":
+            return False
+
+        model_name = self._get_model_for_role(canonical_role, runtime)
+        self._require_installed_ollama_model(model_name, role=canonical_role)
+        keep_alive = ORCHESTRATOR_KEEP_ALIVE if pin else ROLE_LOAD_KEEP_ALIVE
+
+        try:
+            self.ollama_client.load_model(model_name, keep_alive=keep_alive)
+        except RuntimeError as exc:
+            raise ModelManagerError(str(exc)) from exc
+
+        with self._state_lock:
+            self._loaded_models_cache.add(model_name)
+            if pin:
+                self._pinned_models.add(model_name)
+            else:
+                self._pinned_models.discard(model_name)
+        return True
+
+    def _resolve_execution_role(
+        self,
+        *,
+        role: str | None,
+        task_type: str | None,
+        model_name: str,
+        runtime: str,
+    ) -> str | None:
+        if runtime != "ollama":
+            return None
+        if role is not None:
+            return self._canonical_role_name(role)
+        if task_type is not None:
+            return self._get_role_for_task(task_type)
+        for candidate in CANONICAL_ROLES:
+            candidate_runtime = self.get_runtime_for_role(candidate)
+            if candidate_runtime != runtime:
+                continue
+            if self._get_model_for_role(candidate, candidate_runtime) == model_name:
+                return candidate
+        return None
+
+    @staticmethod
+    def _keep_alive_for_role(role: str | None) -> str | int | None:
+        if role == "orchestrator":
+            return ORCHESTRATOR_KEEP_ALIVE
+        if role in {"planning", "coding", "analysis"}:
+            return ROLE_EXECUTION_KEEP_ALIVE
+        return None
 
     def _state_for_model_locked(self, model_name: str) -> ModelState:
         if model_name in self._installed_models_cache:
