@@ -14,8 +14,41 @@ from ai_core.models.manager import ModelState
 
 
 class StubRouter:
-    def __init__(self, *, mode: str = "execution") -> None:
+    class StubOrchestrator:
+        def __init__(self, *, mode: str, conversation_response: str) -> None:
+            self.mode = mode
+            self.conversation_response = conversation_response
+            self.preview_calls: list[dict[str, object]] = []
+            self.generate_calls: list[dict[str, object]] = []
+
+        def preview_fallback_classification(
+            self,
+            task: str,
+            context: dict[str, object],
+            *,
+            session_id: str | None = None,
+        ) -> dict[str, object]:
+            self.preview_calls.append({"task": task, "context": context, "session_id": session_id})
+            return {
+                "mode": self.mode,
+                "task_type": "planning" if self.mode == "conversation" else "system",
+                "agent": "planning",
+                "confidence": 0.9,
+            }
+
+        def generate_conversation_response(
+            self,
+            task: str,
+            context: dict[str, object],
+            *,
+            session_id: str | None = None,
+        ) -> str:
+            self.generate_calls.append({"task": task, "context": context, "session_id": session_id})
+            return self.conversation_response
+
+    def __init__(self, *, mode: str = "execution", conversation_response: str = "Conversation response.") -> None:
         self.mode = mode
+        self.orchestrator = self.StubOrchestrator(mode=mode, conversation_response=conversation_response)
 
     def classify(self, task: str, context: dict[str, object], *, session_id: str | None = None) -> dict[str, object]:
         return {
@@ -40,8 +73,10 @@ class StubRouter:
 class StubPlanningAgent:
     def __init__(self, steps: list[PlanStep]) -> None:
         self.steps = steps
+        self.calls: list[str] = []
 
-    def plan_task(self, command: str) -> PlanningResult:
+    def plan_task(self, command: str, model_role: str = "planning") -> PlanningResult:
+        self.calls.append(command)
         return PlanningResult(
             steps=self.steps,
             source="fallback",
@@ -116,14 +151,17 @@ def build_engine(
     steps: list[PlanStep],
     mode: str = "execution",
     coding_agent: object | None = None,
-) -> tuple[ExecutionEngine, TaskHistoryStore, WorkingMemoryStore]:
+    conversation_response: str = "Conversation response.",
+) -> tuple[ExecutionEngine, TaskHistoryStore, WorkingMemoryStore, StubRouter, StubPlanningAgent]:
     history_store = TaskHistoryStore(tmp_path / "history.db")
     history_store.initialize()
     vector_store = VectorStore(db_path=tmp_path / "vectors.db")
     working_memory_store = WorkingMemoryStore()
+    router = StubRouter(mode=mode, conversation_response=conversation_response)
+    planner = StubPlanningAgent(steps)
     engine = ExecutionEngine(
-        router=StubRouter(mode=mode),  # type: ignore[arg-type]
-        planner=StubPlanningAgent(steps),  # type: ignore[arg-type]
+        router=router,  # type: ignore[arg-type]
+        planner=planner,  # type: ignore[arg-type]
         executor=ExecutorAgent(),
         coding_agent=(coding_agent or StubCodingAgent()),  # type: ignore[arg-type]
         analysis_agent=StubAnalysisAgent(),  # type: ignore[arg-type]
@@ -134,17 +172,26 @@ def build_engine(
         session_manager=SessionManager(),
         vector_store=vector_store,
     )
-    return engine, history_store, working_memory_store
+    return engine, history_store, working_memory_store, router, planner
 
 
 def test_execution_engine_returns_conversation_payload_without_execution(tmp_path: Path) -> None:
-    engine, history_store, working_memory_store = build_engine(tmp_path, steps=[], mode="conversation")
+    engine, history_store, working_memory_store, router, planner = build_engine(
+        tmp_path,
+        steps=[],
+        mode="conversation",
+        conversation_response="I'm doing well. How can I help you today?",
+    )
 
     outcome = engine.run_task("Let's discuss my project idea", {"cwd": str(tmp_path)})
 
     assert outcome.result.success is True
     assert outcome.result.steps == []
     assert outcome.result.data["conversation"]["mode"] == "conversation"
+    assert outcome.result.data["conversation"]["message"] == "I'm doing well. How can I help you today?"
+    assert outcome.result.message == "I'm doing well. How can I help you today?"
+    assert planner.calls == []
+    assert len(router.orchestrator.generate_calls) == 1
     assert working_memory_store.get(outcome.task_id) is None
     assert history_store.get_task(outcome.task_id) is not None
 
@@ -153,7 +200,7 @@ def test_execution_engine_runs_executor_pipeline_and_records_history(tmp_path: P
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     step = PlanStep(description="Create folder demo", role="executor", tool_name="create_folder", args={"path": "demo"})
-    engine, history_store, working_memory_store = build_engine(tmp_path, steps=[step])
+    engine, history_store, working_memory_store, _, _ = build_engine(tmp_path, steps=[step])
 
     outcome = engine.run_task("create a folder demo", {"cwd": str(workspace)})
 
@@ -186,7 +233,7 @@ def test_execution_engine_resolves_denied_approval_without_replanning(tmp_path: 
         requires_approval=True,
         approval_category="package_install",
     )
-    engine, _, working_memory_store = build_engine(tmp_path, steps=[step])
+    engine, _, working_memory_store, _, _ = build_engine(tmp_path, steps=[step])
 
     pending = engine.run_task("install package nano", {"cwd": str(workspace)})
 
@@ -214,7 +261,7 @@ def test_execution_engine_uses_registry_metadata_for_approval(tmp_path: Path) ->
         tool_name="pacman_install",
         args={"package": "nano"},
     )
-    engine, _, working_memory_store = build_engine(tmp_path, steps=[step])
+    engine, _, working_memory_store, _, _ = build_engine(tmp_path, steps=[step])
 
     pending = engine.run_task("install package nano", {"cwd": str(workspace)})
 
@@ -237,7 +284,7 @@ def test_execution_engine_treats_structured_coding_failure_as_failed_step(tmp_pa
         tool_name="coding_pipeline",
         args={"instruction": "update hello"},
     )
-    engine, history_store, _ = build_engine(
+    engine, history_store, _, _, _ = build_engine(
         tmp_path,
         steps=[step],
         coding_agent=FailingCodingAgent(),
@@ -260,7 +307,7 @@ def test_execution_engine_links_continuation_to_previous_task(tmp_path: Path) ->
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     step = PlanStep(description="Create folder demo", role="executor", tool_name="create_folder", args={"path": "demo"})
-    engine, history_store, _ = build_engine(tmp_path, steps=[step])
+    engine, history_store, _, _, _ = build_engine(tmp_path, steps=[step])
 
     first = engine.run_task("create a folder demo", {"cwd": str(workspace)})
     second = engine.run_task("continue and add to this setup", {"cwd": str(workspace)})
@@ -334,6 +381,40 @@ def test_execution_engine_blocks_when_orchestrator_is_not_installed(tmp_path: Pa
         "Orchestrator model is not installed yet. Please wait while it is downloading. "
         "You can continue using normal terminal commands."
     )
+    assert download_manager.queued_roles == ["orchestrator"]
+
+
+def test_execution_engine_uses_conversation_ready_message_when_orchestrator_is_missing(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    router = StubRouter(mode="conversation")
+    download_manager = RecordingDownloadManager()
+    history_store = TaskHistoryStore(tmp_path / "history.db")
+    history_store.initialize()
+    planner = StubPlanningAgent([])
+    engine = ExecutionEngine(
+        router=router,  # type: ignore[arg-type]
+        planner=planner,  # type: ignore[arg-type]
+        executor=ExecutorAgent(),
+        coding_agent=StubCodingAgent(),  # type: ignore[arg-type]
+        analysis_agent=StubAnalysisAgent(),  # type: ignore[arg-type]
+        approval_store=ApprovalStore(),
+        history_store=history_store,
+        working_memory_store=WorkingMemoryStore(),
+        rollback_manager=RollbackManager(history_store),
+        session_manager=SessionManager(),
+        vector_store=VectorStore(db_path=tmp_path / "vectors.db"),
+        model_manager=LifecycleModelManager({"orchestrator": ModelState.NOT_INSTALLED}),
+        download_manager=download_manager,  # type: ignore[arg-type]
+    )
+
+    outcome = engine.run_task("how are you", {"cwd": str(workspace)})
+
+    assert outcome.result.success is False
+    assert outcome.result.message == (
+        "AI system is not ready yet. Please wait for the orchestrator model to finish downloading."
+    )
+    assert planner.calls == []
     assert download_manager.queued_roles == ["orchestrator"]
 
 

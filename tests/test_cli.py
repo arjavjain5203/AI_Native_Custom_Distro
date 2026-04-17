@@ -160,6 +160,45 @@ def test_cli_task_greeting_prints_json_then_hello(monkeypatch, capsys) -> None:
     assert stdout_lines[-1] == "Hello."
 
 
+def test_cli_task_conversation_prints_json_then_conversation_message(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        cli_main,
+        "submit_task",
+        lambda command, base_url: {
+            "task_id": "task-4",
+            "status": "completed",
+            "success": True,
+            "message": "I'm doing well. How can I help you today?",
+            "command": command,
+            "cwd": "/root",
+            "steps": [],
+            "result": {
+                "status": "completed",
+                "routing": {"task_type": "planning", "role": "planning"},
+                "files_modified": [],
+                "steps_completed": [],
+                "errors": [],
+                "model_notices": [],
+                "conversation": {
+                    "mode": "conversation",
+                    "agent": "planning",
+                    "message": "I'm doing well. How can I help you today?",
+                    "command": command,
+                    "cwd": "/root",
+                },
+            },
+            "approval_request": None,
+        },
+    )
+
+    exit_code = cli_main.main(["how", "are", "you"])
+
+    assert exit_code == 0
+    stdout_lines = capsys.readouterr().out.strip().splitlines()
+    assert json.loads("\n".join(stdout_lines[:-1]))["command"] == "how are you"
+    assert stdout_lines[-1] == "I'm doing well. How can I help you today?"
+
+
 def test_cli_task_folder_creation_prints_json_then_success_summary(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         cli_main,

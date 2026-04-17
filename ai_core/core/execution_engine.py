@@ -23,6 +23,9 @@ ORCHESTRATOR_MISSING_MESSAGE = (
     "Orchestrator model is not installed yet. Please wait while it is downloading. "
     "You can continue using normal terminal commands."
 )
+CONVERSATION_ORCHESTRATOR_MISSING_MESSAGE = (
+    "AI system is not ready yet. Please wait for the orchestrator model to finish downloading."
+)
 DOWNLOAD_MESSAGE_TEMPLATE = "Model {name} is downloading. You can run basic tasks."
 FALLBACK_MESSAGE = "Using a smaller model because the preferred model is still downloading."
 BLOCK_MESSAGE = "This task requires a more capable model. Please wait for the model to finish downloading."
@@ -82,8 +85,9 @@ class ExecutionEngine:
         try:
             routing_context = self._build_routing_context(cwd, command)
             parent_task_id = self._resolve_parent_task_id(command, routing_context)
+            requested_mode = self._predict_requested_mode(command, routing_context, session_id=cwd)
 
-            orchestrator_gate = self._guard_orchestrator()
+            orchestrator_gate = self._guard_orchestrator(requested_mode=requested_mode)
             if orchestrator_gate is not None:
                 result = orchestrator_gate
                 self._update_session_task_state(
@@ -101,7 +105,7 @@ class ExecutionEngine:
                 routing["confidence"] = decision.get("confidence")
 
                 if decision.get("mode") == "conversation":
-                    result = self._build_conversation_result(command, cwd, routing)
+                    result = self._handle_conversation(command, cwd, routing_context, routing)
                     self._update_session_task_state(
                         cwd,
                         status="conversation",
@@ -414,19 +418,24 @@ class ExecutionEngine:
             "related_tasks": self.vector_store.get_related_tasks(command, cwd, limit=3),
         }
 
-    def _guard_orchestrator(self) -> TaskResult | None:
+    def _guard_orchestrator(self, *, requested_mode: str) -> TaskResult | None:
         if self.model_manager is None:
             return None
 
         role = "orchestrator"
         state = self.model_manager.get_model_state(role)
         model_name = self.model_manager.get_model_name_for_role(role)
+        missing_message = (
+            CONVERSATION_ORCHESTRATOR_MISSING_MESSAGE
+            if requested_mode == "conversation"
+            else ORCHESTRATOR_MISSING_MESSAGE
+        )
         if state == ModelState.INSTALLED:
             return None
         if state == ModelState.NOT_INSTALLED:
             self._enqueue_download(role)
             return self._build_lifecycle_failure(
-                message=ORCHESTRATOR_MISSING_MESSAGE,
+                message=missing_message,
                 role=role,
                 model_name=model_name,
                 model_state=ModelState.DOWNLOADING,
@@ -434,7 +443,7 @@ class ExecutionEngine:
             )
         if state == ModelState.DOWNLOADING:
             return self._build_lifecycle_failure(
-                message=ORCHESTRATOR_MISSING_MESSAGE,
+                message=missing_message,
                 role=role,
                 model_name=model_name,
                 model_state=state,
@@ -761,17 +770,18 @@ class ExecutionEngine:
             return
         self.vector_store.index_task_summary(task_id, cwd, summary)
 
-    @staticmethod
-    def _build_conversation_result(command: str, cwd: str, routing: dict[str, Any]) -> TaskResult:
+    def _handle_conversation(
+        self,
+        command: str,
+        cwd: str,
+        routing_context: dict[str, Any],
+        routing: dict[str, Any],
+    ) -> TaskResult:
         role = str(routing.get("role", "planning"))
-        guidance_by_role = {
-            "planning": "Conversation mode active. Clarify requirements or say what to execute next.",
-            "coding": "Conversation mode active. Describe the code change in more detail or say to apply it.",
-            "analysis": "Conversation mode active. Share the error, logs, or state you want analyzed.",
-        }
+        message = self._conversation_response(command, routing_context, session_id=cwd)
         return TaskResult(
             success=True,
-            message="Conversation mode active.",
+            message=message,
             steps=[],
             data={
                 "status": "completed",
@@ -783,12 +793,52 @@ class ExecutionEngine:
                 "conversation": {
                     "mode": "conversation",
                     "agent": role,
-                    "message": guidance_by_role.get(role, guidance_by_role["planning"]),
+                    "message": message,
                     "command": command,
                     "cwd": cwd,
                 },
             },
         )
+
+    def _conversation_response(
+        self,
+        command: str,
+        routing_context: dict[str, Any],
+        *,
+        session_id: str | None = None,
+    ) -> str:
+        orchestrator = getattr(self.router, "orchestrator", None)
+        if orchestrator is not None and hasattr(orchestrator, "generate_conversation_response"):
+            return str(
+                orchestrator.generate_conversation_response(
+                    command,
+                    routing_context,
+                    session_id=session_id,
+                )
+            ).strip()
+        return "I can help with questions or tasks. Tell me what you want to understand or what you want me to do."
+
+    def _predict_requested_mode(
+        self,
+        command: str,
+        routing_context: dict[str, Any],
+        *,
+        session_id: str | None = None,
+    ) -> str:
+        orchestrator = getattr(self.router, "orchestrator", None)
+        if orchestrator is not None and hasattr(orchestrator, "preview_fallback_classification"):
+            try:
+                decision = orchestrator.preview_fallback_classification(
+                    command,
+                    routing_context,
+                    session_id=session_id,
+                )
+                mode = str(decision.get("mode", "execution"))
+                if mode in {"conversation", "execution"}:
+                    return mode
+            except Exception:
+                return "execution"
+        return "execution"
 
     def _store_execution_state(self, state: ExecutionState) -> None:
         self.working_memory_store.create(

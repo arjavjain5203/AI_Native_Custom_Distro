@@ -68,6 +68,20 @@ def test_orchestrator_falls_back_on_timeout() -> None:
     assert decision["task_type"] == "planning"
 
 
+def test_orchestrator_defaults_low_confidence_model_decision_to_conversation() -> None:
+    manager = FakeModelManager(
+        response='{"mode":"execution","task_type":"coding","agent":"coding","confidence":0.21}'
+    )
+    orchestrator = Orchestrator(model_manager=manager)
+
+    decision = orchestrator.classify_input("what is python?", {})
+
+    assert decision["mode"] == "conversation"
+    assert decision["task_type"] == "planning"
+    assert decision["agent"] == "planning"
+    assert decision["confidence"] == 0.21
+
+
 def test_orchestrator_falls_back_on_model_failure() -> None:
     manager = FakeModelManager(error=OllamaError("ollama unavailable"))
     orchestrator = Orchestrator(model_manager=manager)
@@ -97,6 +111,28 @@ def test_orchestrator_falls_back_to_system_for_list_files_request() -> None:
 
     assert decision["mode"] == "execution"
     assert decision["task_type"] == "system"
+    assert decision["agent"] == "planning"
+
+
+def test_orchestrator_falls_back_to_conversation_for_greeting() -> None:
+    manager = FakeModelManager(error=OllamaError("ollama unavailable"))
+    orchestrator = Orchestrator(model_manager=manager)
+
+    decision = orchestrator.classify_input("hi", {})
+
+    assert decision["mode"] == "conversation"
+    assert decision["task_type"] == "planning"
+    assert decision["agent"] == "planning"
+
+
+def test_orchestrator_falls_back_to_conversation_for_general_question() -> None:
+    manager = FakeModelManager(error=OllamaError("ollama unavailable"))
+    orchestrator = Orchestrator(model_manager=manager)
+
+    decision = orchestrator.classify_input("what is python?", {})
+
+    assert decision["mode"] == "conversation"
+    assert decision["task_type"] == "planning"
     assert decision["agent"] == "planning"
 
 
@@ -171,6 +207,27 @@ def test_orchestrator_switches_from_conversation_to_execution_on_follow_up() -> 
     assert decision["mode"] == "execution"
     assert decision["task_type"] == "system"
     assert decision["agent"] == "planning"
+
+
+def test_orchestrator_generates_conversation_response_with_model() -> None:
+    manager = FakeModelManager(response="I'm doing well. How can I help you today?")
+    orchestrator = Orchestrator(model_manager=manager, timeout_seconds=4)
+
+    response = orchestrator.generate_conversation_response("how are you", {"cwd": "/tmp/project"})
+
+    assert response == "I'm doing well. How can I help you today?"
+    assert manager.calls[0]["role"] == "orchestrator"
+    assert manager.calls[0]["timeout_seconds"] == 4
+    assert "Respond in plain text only." in str(manager.calls[0]["prompt"])
+
+
+def test_orchestrator_falls_back_to_natural_conversation_response_on_model_failure() -> None:
+    manager = FakeModelManager(error=OllamaError("ollama unavailable"))
+    orchestrator = Orchestrator(model_manager=manager)
+
+    response = orchestrator.generate_conversation_response("how are you", {"cwd": "/tmp/project"})
+
+    assert response == "I'm doing well. How can I help you today?"
 
 
 def test_orchestrator_routes_implement_it_to_coding_after_planning() -> None:

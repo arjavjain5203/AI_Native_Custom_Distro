@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 VALID_MODES = {"conversation", "execution"}
 VALID_TASK_TYPES = {"planning", "coding", "analysis", "system"}
 VALID_AGENTS = {"planning", "coding", "analysis"}
+LOW_CONFIDENCE_THRESHOLD = 0.6
 
 
 class Orchestrator:
@@ -47,7 +48,7 @@ class Orchestrator:
                 self._build_prompt(cleaned, context),
                 timeout_seconds=self.timeout_seconds,
             )
-            decision = self._parse_and_validate_response(response)
+            decision = self._normalize_decision(self._parse_and_validate_response(response), cleaned)
             self._record_session(session_id, cleaned, decision)
             logger.info("Orchestrator model decision: %s", decision)
             return decision
@@ -154,6 +155,40 @@ User input:
         decision = self._fallback_classification(user_input, merged_context)
         self._record_session(session_id, user_input.strip(), decision)
         return decision
+
+    def preview_fallback_classification(
+        self,
+        user_input: str,
+        context: dict[str, Any] | None = None,
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the fallback routing decision without mutating session state."""
+        merged_context = self._merge_context(session_id, context or {})
+        return self._fallback_classification(user_input.strip(), merged_context)
+
+    def generate_conversation_response(
+        self,
+        user_input: str,
+        context: dict[str, Any] | None = None,
+        *,
+        session_id: str | None = None,
+    ) -> str:
+        """Generate a natural-language conversation response without invoking planning."""
+        cleaned = user_input.strip()
+        merged_context = self._merge_context(session_id, context or {})
+        try:
+            response = self.model_manager.run_role_model(
+                "orchestrator",
+                self._build_conversation_prompt(cleaned, merged_context),
+                timeout_seconds=self.timeout_seconds,
+            )
+            if not isinstance(response, str) or not response.strip():
+                raise ValueError("conversation response must be a non-empty string")
+            return response.strip()
+        except (ModelManagerError, OllamaError, TimeoutError, ValueError) as exc:
+            logger.warning("Conversation fallback triggered: %s", exc)
+            return self._fallback_conversation_response(cleaned)
 
     def _fallback_classification(self, user_input: str, context: dict[str, Any]) -> dict[str, Any]:
         lowered = user_input.lower()
@@ -274,6 +309,54 @@ User input:
             "agent": "planning",
             "confidence": 0.55 if not self._looks_like_execution_trigger(lowered) else 0.57,
         }
+
+    def _build_conversation_prompt(self, user_input: str, context: dict[str, Any]) -> str:
+        recent_messages = context.get("recent_messages", [])
+        current_task_state = context.get("current_task_state")
+        return f"""
+You are the conversation interface for a local AI-native operating environment.
+
+Respond in plain text only.
+Do not return JSON.
+Do not mention planners, tools, or pipelines.
+Be concise and helpful.
+If the user is greeting you, greet them back naturally.
+If the user asks a general question, answer it directly.
+If the user is vague, ask one clarifying question.
+
+Current context:
+cwd={context.get("cwd")}
+last_mode={context.get("last_mode")}
+last_task_type={context.get("last_task_type")}
+last_agent={context.get("last_agent")}
+recent_messages={recent_messages}
+current_task_state={current_task_state}
+
+User input:
+{user_input}
+""".strip()
+
+    @staticmethod
+    def _normalize_decision(decision: dict[str, Any], user_input: str) -> dict[str, Any]:
+        if float(decision.get("confidence", 0.0)) >= LOW_CONFIDENCE_THRESHOLD:
+            return decision
+        return {
+            "mode": "conversation",
+            "task_type": "planning",
+            "agent": "planning",
+            "confidence": float(decision.get("confidence", 0.0)),
+        }
+
+    @staticmethod
+    def _fallback_conversation_response(user_input: str) -> str:
+        lowered = " ".join(user_input.lower().split())
+        if lowered in {"hi", "hello", "hey", "hii", "yo"}:
+            return "Hello. How can I help you today?"
+        if re.search(r"\bhow are you\b", lowered):
+            return "I'm doing well. How can I help you today?"
+        if re.search(r"\bwhat is python\b|\bpython\?\b", lowered):
+            return "Python is a high-level programming language used for automation, web development, data work, and AI."
+        return "I can help with questions or tasks. Tell me what you want to understand or what you want me to do."
 
     def _merge_context(self, session_id: str | None, context: dict[str, Any]) -> dict[str, Any]:
         merged = {}
